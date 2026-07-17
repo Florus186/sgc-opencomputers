@@ -22,7 +22,7 @@ local DIAL_TIMEOUT = 60
 -- Temps pendant lequel l'alarme sonne après le début
 -- de la composition. Mettre 0 pour la laisser sonner
 -- jusqu'à la connexion ou l'échec.
-local ALARM_DURATION = 8
+local ALARM_DURATION = 0
 
 ------------------------------------------------------------
 -- VARIABLES GLOBALES
@@ -479,29 +479,46 @@ local function openGate(rawAddress)
   local startTime = computer.uptime()
   local alarmStopTime = startTime + ALARM_DURATION
   local timeoutTime = startTime + DIAL_TIMEOUT
-  local previousState = nil
+    local previousState = nil
+  local previousChevrons = -1
   local connected = false
 
   while computer.uptime() < timeoutTime do
     local currentState, chevrons, direction =
       getGateState()
 
-    if currentState ~= previousState then
-      print(
-        "[" .. math.floor(computer.uptime() - startTime) ..
-        "s] " ..
-        "Etat: " .. safeToString(currentState) ..
-        " | Chevrons: " .. safeToString(chevrons) ..
-        " | Direction: " .. safeToString(direction)
-      )
+    chevrons = tonumber(chevrons) or 0
+
+    if currentState ~= previousState
+       or chevrons ~= previousChevrons then
+
+      local elapsed =
+        math.floor(computer.uptime() - startTime)
+
+      if chevrons > previousChevrons and chevrons > 0 then
+        print(
+          "[" .. elapsed .. "s] CHEVRON " ..
+          tostring(chevrons) .. " ENGAGE"
+        )
+      end
+
+      if currentState ~= previousState then
+        print(
+          "[" .. elapsed .. "s] ETAT : " ..
+          safeToString(currentState) ..
+          " | DIRECTION : " ..
+          safeToString(direction)
+        )
+      end
 
       log(
         "Composition " .. address ..
         " - Etat : " .. safeToString(currentState) ..
-        ", chevrons : " .. safeToString(chevrons)
+        ", chevrons : " .. tostring(chevrons)
       )
 
       previousState = currentState
+      previousChevrons = chevrons
     end
 
     -- Arrêt automatique de l'alarme après le délai choisi
