@@ -22,6 +22,9 @@ local TEAM_DATABASE_FILE = DATA_DIRECTORY .. "/teams.db"
 local DEFCON_DATABASE_FILE = DATA_DIRECTORY .. "/defcon.db"
 local DEFCON_LOG_FILE = LOG_DIRECTORY .. "/defcon.log"
 local INTELLIGENCE_DATABASE_FILE = DATA_DIRECTORY .. "/intelligence.db"
+local ROLES_DATABASE_FILE = DATA_DIRECTORY .. "/roles.db"
+local USERS_DATABASE_FILE = DATA_DIRECTORY .. "/users.db"
+local SECURITY_LOG_FILE = LOG_DIRECTORY .. "/security.log"
 
 -- Durée maximale autorisée pour une composition
 local DIAL_TIMEOUT = 60
@@ -158,6 +161,118 @@ local defconChangedAt = 0
 
 -- Renseignements persistants accumulés au fil des missions.
 local intelligenceData = {}
+
+-- Personnel et droits logiciels.
+-- Les identifiants USR sont prêts pour les futures cartes OpenSecurity.
+local personnelRoles = {}
+local personnelUsers = {}
+local currentUser = nil
+
+local DEFAULT_ROLES = {
+  GENERAL = {
+    label = "GENERAL",
+    permissions = {
+      dashboard = true,
+      operations = true,
+      missions = true,
+      dial = true,
+      close_gate = true,
+      iris = true,
+      idc = true,
+      intelligence_view = true,
+      intelligence_edit = true,
+      address_book = true,
+      teams = true,
+      mission_logs = true,
+      technical_logs = true,
+      diagnostics = true,
+      sgcraft_methods = true,
+      alarm_stop = true,
+      defcon_view = true,
+      defcon_change = true,
+      defcon_black = true,
+      personnel_view = true,
+      personnel_switch = true,
+      personnel_admin = true,
+      shutdown = true
+    }
+  },
+
+  CHIEF_OPERATOR = {
+    label = "CHEF OPERATEUR",
+    permissions = {
+      dashboard = true,
+      operations = true,
+      missions = true,
+      dial = true,
+      close_gate = true,
+      iris = true,
+      idc = true,
+      intelligence_view = true,
+      intelligence_edit = true,
+      address_book = true,
+      teams = true,
+      mission_logs = true,
+      technical_logs = true,
+      diagnostics = true,
+      sgcraft_methods = true,
+      alarm_stop = true,
+      defcon_view = true,
+      defcon_change = true,
+      personnel_view = true,
+      personnel_switch = true,
+      shutdown = true
+    }
+  },
+
+  OPERATOR = {
+    label = "OPERATEUR",
+    permissions = {
+      dashboard = true,
+      operations = true,
+      dial = true,
+      close_gate = true,
+      iris = true,
+      idc = true,
+      intelligence_view = true,
+      address_book = true,
+      mission_logs = true,
+      diagnostics = true,
+      alarm_stop = true,
+      defcon_view = true,
+      personnel_view = true,
+      personnel_switch = true,
+      shutdown = true
+    }
+  }
+}
+
+local DEFAULT_USERS = {
+  {
+    id = "USR001",
+    login = "HAMMOND",
+    name = "George Hammond",
+    rank = "Major General",
+    role = "GENERAL",
+    enabled = true
+  },
+  {
+    id = "USR002",
+    login = "WALTER",
+    name = "Walter Harriman",
+    rank = "Master Sergeant",
+    role = "CHIEF_OPERATOR",
+    enabled = true
+  },
+  {
+    id = "USR003",
+    login = "PIERCE",
+    name = "Nathan Pierce",
+    rank = "Technical Sergeant",
+    role = "OPERATOR",
+    enabled = true
+  }
+}
 
 -- Interface graphique légère.
 local gpu = component.isAvailable("gpu") and component.gpu or nil
@@ -323,6 +438,574 @@ local function missionLog(message)
   return true
 end
 
+
+local function securityTimestamp()
+  if os.date then
+    return os.date("%Y-%m-%d %H:%M:%S")
+  end
+
+  return "UPTIME " .. math.floor(computer.uptime())
+end
+
+local function securityLog(action, details)
+  initializeLog()
+  local file = io.open(SECURITY_LOG_FILE, "a")
+
+  if not file then
+    return false
+  end
+
+  local actor = "SYSTEME"
+  local actorId = "SYS000"
+  local role = "SYSTEME"
+
+  if currentUser then
+    actor = currentUser.name
+    actorId = currentUser.id
+    role = currentUser.role
+  end
+
+  file:write(
+    "[" .. securityTimestamp() .. "] " ..
+    actorId .. " | " .. actor .. " | " .. role ..
+    " | " .. tostring(action or "EVENEMENT") ..
+    " | " .. tostring(details or "") .. "\n"
+  )
+  file:close()
+  return true
+end
+
+local function clonePermissions(source)
+  local target = {}
+
+  for permission, allowed in pairs(source or {}) do
+    target[permission] = allowed == true
+  end
+
+  return target
+end
+
+local function initializePersonnelDefaults()
+  personnelRoles = {}
+
+  for roleId, role in pairs(DEFAULT_ROLES) do
+    personnelRoles[roleId] = {
+      label = role.label,
+      permissions = clonePermissions(role.permissions)
+    }
+  end
+
+  personnelUsers = {}
+
+  for _, user in ipairs(DEFAULT_USERS) do
+    personnelUsers[user.id] = {
+      id = user.id,
+      login = user.login,
+      name = user.name,
+      rank = user.rank,
+      role = user.role,
+      enabled = user.enabled == true
+    }
+  end
+end
+
+local function sortedPermissionNames(permissions)
+  local names = {}
+
+  for permission, allowed in pairs(permissions or {}) do
+    if allowed then
+      table.insert(names, permission)
+    end
+  end
+
+  table.sort(names)
+  return names
+end
+
+local function saveRoles()
+  ensureDataDirectory()
+  local file = io.open(ROLES_DATABASE_FILE, "w")
+
+  if not file then
+    return false
+  end
+
+  local roleNames = {}
+
+  for roleId in pairs(personnelRoles) do
+    table.insert(roleNames, roleId)
+  end
+
+  table.sort(roleNames)
+
+  for _, roleId in ipairs(roleNames) do
+    local role = personnelRoles[roleId]
+
+    file:write(
+      roleId .. "|" ..
+      tostring(role.label or roleId) .. "|" ..
+      table.concat(
+        sortedPermissionNames(role.permissions),
+        ","
+      ) .. "\n"
+    )
+  end
+
+  file:close()
+  return true
+end
+
+local function saveUsers()
+  ensureDataDirectory()
+  local file = io.open(USERS_DATABASE_FILE, "w")
+
+  if not file then
+    return false
+  end
+
+  local userIds = {}
+
+  for userId in pairs(personnelUsers) do
+    table.insert(userIds, userId)
+  end
+
+  table.sort(userIds)
+
+  for _, userId in ipairs(userIds) do
+    local user = personnelUsers[userId]
+
+    file:write(table.concat({
+      user.id,
+      user.login,
+      user.name,
+      user.rank,
+      user.role,
+      user.enabled and "1" or "0"
+    }, "|") .. "\n")
+  end
+
+  file:close()
+  return true
+end
+
+local function loadRoles()
+  personnelRoles = {}
+  local file = io.open(ROLES_DATABASE_FILE, "r")
+
+  if not file then
+    initializePersonnelDefaults()
+    saveRoles()
+    return
+  end
+
+  for line in file:lines() do
+    local roleId, label, permissionList =
+      line:match("^([^|]+)|([^|]*)|(.*)$")
+
+    if roleId and roleId ~= "" then
+      local permissions = {}
+
+      for permission in
+        tostring(permissionList):gmatch("[^,]+") do
+        permissions[permission] = true
+      end
+
+      personnelRoles[roleId] = {
+        label = label ~= "" and label or roleId,
+        permissions = permissions
+      }
+    end
+  end
+
+  file:close()
+
+  if not next(personnelRoles) then
+    initializePersonnelDefaults()
+    saveRoles()
+  end
+end
+
+local function loadUsers()
+  personnelUsers = {}
+  local file = io.open(USERS_DATABASE_FILE, "r")
+
+  if not file then
+    for _, user in ipairs(DEFAULT_USERS) do
+      personnelUsers[user.id] = {
+        id = user.id,
+        login = user.login,
+        name = user.name,
+        rank = user.rank,
+        role = user.role,
+        enabled = user.enabled == true
+      }
+    end
+
+    saveUsers()
+    return
+  end
+
+  for line in file:lines() do
+    local fields = {}
+
+    for field in (line .. "|"):gmatch("(.-)|") do
+      table.insert(fields, field)
+    end
+
+    if fields[1] and fields[1] ~= "" then
+      personnelUsers[fields[1]] = {
+        id = fields[1],
+        login = fields[2] or fields[1],
+        name = fields[3] or fields[1],
+        rank = fields[4] or "",
+        role = fields[5] or "OPERATOR",
+        enabled = fields[6] ~= "0"
+      }
+    end
+  end
+
+  file:close()
+
+  if not next(personnelUsers) then
+    initializePersonnelDefaults()
+    saveUsers()
+  end
+end
+
+local function loadPersonnel()
+  loadRoles()
+  loadUsers()
+end
+
+local function hasPermission(permission)
+  if not currentUser or not currentUser.enabled then
+    return false
+  end
+
+  local role = personnelRoles[currentUser.role]
+
+  return role and role.permissions and
+    role.permissions[permission] == true
+end
+
+local function denyPermission(permission)
+  header()
+  printColored("ACCES REFUSE", UI_COLORS.red)
+  separator()
+  print("Permission requise : " .. tostring(permission))
+  print()
+  print(
+    "Utilisateur : " ..
+    (currentUser and currentUser.name or "AUCUN")
+  )
+  print(
+    "Role        : " ..
+    (currentUser and currentUser.role or "AUCUN")
+  )
+  print()
+  securityLog("ACCES REFUSE", permission)
+  waitForEnter()
+end
+
+local function requirePermission(permission)
+  if hasPermission(permission) then
+    return true
+  end
+
+  denyPermission(permission)
+  return false
+end
+
+local function orderedUsers()
+  local users = {}
+
+  for _, user in pairs(personnelUsers) do
+    table.insert(users, user)
+  end
+
+  table.sort(users, function(a, b)
+    return a.id < b.id
+  end)
+
+  return users
+end
+
+local function findUserByCredential(value)
+  local token =
+    tostring(value or ""):upper():gsub("%s+", "")
+
+  for _, user in pairs(personnelUsers) do
+    if user.id:upper() == token or
+       user.login:upper() == token then
+      return user
+    end
+  end
+
+  return nil
+end
+
+local function loginScreen(allowCancel)
+  while true do
+    clear()
+    printColored("================================", UI_COLORS.title)
+    printColored("       STARGATE COMMAND", UI_COLORS.title)
+    printColored("   CONTROLE D'ACCES OPERATEUR", UI_COLORS.cyan)
+    printColored("================================", UI_COLORS.title)
+    print()
+
+    local users = orderedUsers()
+
+    for index, user in ipairs(users) do
+      local role = personnelRoles[user.role]
+      local state = user.enabled and "ACTIF" or "DESACTIVE"
+
+      print(
+        tostring(index) .. " - " ..
+        user.rank .. " " .. user.name
+      )
+      print(
+        "    " .. user.id .. " / " ..
+        safeToString(role and role.label or user.role) ..
+        " / " .. state
+      )
+    end
+
+    print()
+    print("Numero, identifiant USR ou login.")
+
+    if allowCancel then
+      print("0 - Annuler")
+    end
+
+    print()
+    io.write("Identification > ")
+    local value = io.read()
+
+    if allowCancel and value == "0" then
+      return false
+    end
+
+    local selected = nil
+    local index = tonumber(value)
+
+    if index and users[index] then
+      selected = users[index]
+    else
+      selected = findUserByCredential(value)
+    end
+
+    if not selected then
+      print()
+      print("Identifiant inconnu.")
+      securityLog("ECHEC CONNEXION", tostring(value))
+      pause(1)
+    elseif not selected.enabled then
+      print()
+      print("Profil desactive.")
+      securityLog(
+        "ECHEC CONNEXION",
+        selected.id .. " PROFIL DESACTIVE"
+      )
+      pause(1)
+    else
+      local previous =
+        currentUser and currentUser.id or "AUCUN"
+
+      currentUser = selected
+      securityLog(
+        "CONNEXION",
+        "SESSION PRECEDENTE " .. previous
+      )
+
+      clear()
+      printColored("IDENTIFICATION ACCEPTEE", UI_COLORS.green)
+      print()
+      print("Bienvenue,")
+      print(selected.rank .. " " .. selected.name)
+      print()
+      print("Identifiant : " .. selected.id)
+      print(
+        "Role        : " ..
+        safeToString(
+          personnelRoles[selected.role] and
+          personnelRoles[selected.role].label or
+          selected.role
+        )
+      )
+      pause(2)
+      return true
+    end
+  end
+end
+
+local function showUserProfile(user)
+  local role = personnelRoles[user.role]
+  local permissions =
+    sortedPermissionNames(role and role.permissions or {})
+
+  header()
+  print("DOSSIER PERSONNEL")
+  separator()
+  print("ID       : " .. user.id)
+  print("LOGIN    : " .. user.login)
+  print("NOM      : " .. user.name)
+  print("GRADE    : " .. user.rank)
+  print("ROLE     : " ..
+    safeToString(role and role.label or user.role))
+  print("ETAT     : " ..
+    (user.enabled and "ACTIF" or "DESACTIVE"))
+  print()
+  print("PERMISSIONS")
+  separator()
+
+  for _, permission in ipairs(permissions) do
+    print("+ " .. permission)
+  end
+
+  waitForEnter()
+end
+
+local function showSecurityLogs()
+  if not requirePermission("personnel_view") then
+    return
+  end
+
+  header()
+  print("JOURNAL DE SECURITE")
+  separator()
+
+  local file = io.open(SECURITY_LOG_FILE, "r")
+
+  if not file then
+    print("Aucun evenement de securite.")
+    waitForEnter()
+    return
+  end
+
+  local lines = {}
+
+  for line in file:lines() do
+    table.insert(lines, line)
+
+    if #lines > 35 then
+      table.remove(lines, 1)
+    end
+  end
+
+  file:close()
+
+  for _, line in ipairs(lines) do
+    print(line)
+  end
+
+  waitForEnter()
+end
+
+local function personnelMenu()
+  if not requirePermission("personnel_view") then
+    return
+  end
+
+  while true do
+    header()
+    printColored("PERSONNEL SGC", UI_COLORS.cyan)
+    separator()
+    print("1 - Changer d'operateur")
+    print("2 - Consulter les profils")
+    print("3 - Consulter les roles")
+    print("4 - Journal de securite")
+    print("5 - Sauvegarder utilisateurs et roles")
+    print("0 - Retour")
+    print()
+    io.write("Personnel > ")
+
+    local choice = io.read()
+
+    if choice == "0" then
+      return
+
+    elseif choice == "1" then
+      if requirePermission("personnel_switch") then
+        loginScreen(true)
+      end
+
+    elseif choice == "2" then
+      local users = orderedUsers()
+
+      header()
+      print("PROFILS DU PERSONNEL")
+      separator()
+
+      for index, user in ipairs(users) do
+        print(
+          tostring(index) .. " - " ..
+          user.id .. " | " ..
+          user.rank .. " " .. user.name ..
+          " | " .. user.role
+        )
+      end
+
+      print()
+      io.write("Profil (0 retour) > ")
+      local index = tonumber(io.read())
+
+      if index and index > 0 and users[index] then
+        showUserProfile(users[index])
+      end
+
+    elseif choice == "3" then
+      header()
+      print("ROLES ET AUTORISATIONS")
+      separator()
+
+      local roleIds = {}
+
+      for roleId in pairs(personnelRoles) do
+        table.insert(roleIds, roleId)
+      end
+
+      table.sort(roleIds)
+
+      for _, roleId in ipairs(roleIds) do
+        local role = personnelRoles[roleId]
+        print()
+        print(roleId .. " - " .. role.label)
+
+        for _, permission in ipairs(
+          sortedPermissionNames(role.permissions)
+        ) do
+          print("  + " .. permission)
+        end
+      end
+
+      waitForEnter()
+
+    elseif choice == "4" then
+      showSecurityLogs()
+
+    elseif choice == "5" then
+      if requirePermission("personnel_admin") then
+        saveRoles()
+        saveUsers()
+        securityLog(
+          "SAUVEGARDE PERSONNEL",
+          ROLES_DATABASE_FILE .. " / " ..
+          USERS_DATABASE_FILE
+        )
+        print()
+        print("Fichiers sauvegardes :")
+        print(ROLES_DATABASE_FILE)
+        print(USERS_DATABASE_FILE)
+        waitForEnter()
+      end
+
+    else
+      print("Commande inconnue.")
+      pause(1)
+    end
+  end
+end
+
 local function defconTimestamp()
   if os.date then
     return os.date("%Y-%m-%d %H:%M:%S")
@@ -420,6 +1103,7 @@ local function setDefcon(level, reason, source)
   defconLog(message)
   missionLog(message)
   log(message)
+  securityLog("CHANGEMENT DEFCON", message)
   saveDefcon()
 
   if defconLevel == "ROUGE" then
@@ -636,6 +1320,23 @@ local function header()
     printColored("      !!! ALERTE NOIRE !!!", UI_COLORS.red)
   else
     printColored("      ALERTE : " .. defconLevel, alertColor())
+  end
+
+  if currentUser then
+    print(
+      "OPERATEUR : " .. currentUser.name ..
+      " [" .. currentUser.id .. "]"
+    )
+    print(
+      "FONCTION  : " ..
+      safeToString(
+        personnelRoles[currentUser.role] and
+        personnelRoles[currentUser.role].label or
+        currentUser.role
+      )
+    )
+  else
+    printColored("OPERATEUR : AUCUNE SESSION", UI_COLORS.red)
   end
 
   printColored("================================", UI_COLORS.title)
@@ -2011,6 +2712,10 @@ local function formatIntelTime(value)
 end
 
 local function editIntelligenceRecord(name)
+  if not requirePermission("intelligence_edit") then
+    return
+  end
+
   local record = getIntelligenceRecord(name)
 
   while true do
@@ -2993,6 +3698,21 @@ local function showDefconControl()
       if not requested then
         print("Choix inconnu.")
         pause(1)
+      elseif not hasPermission("defcon_change") then
+        denyPermission("defcon_change")
+      elseif requested == "NOIR" and
+             not hasPermission("defcon_black") then
+        header()
+        printColored(
+          "AUTORISATION STRATEGIQUE REQUISE",
+          UI_COLORS.red
+        )
+        separator()
+        print("Le passage au DEFCON NOIR est reserve")
+        print("au commandement general.")
+        print()
+        securityLog("ACCES REFUSE", "DEFCON NOIR")
+        waitForEnter()
       else
         print()
         io.write("Motif du changement > ")
@@ -3175,6 +3895,12 @@ local function showTacticalDashboard()
 
   printColored("TABLEAU TACTIQUE", UI_COLORS.cyan)
   separator()
+  print(
+    "SESSION    : " ..
+    (currentUser and currentUser.id or "AUCUNE") ..
+    " / " ..
+    (currentUser and currentUser.role or "AUCUN ROLE")
+  )
   print("PORTE      : " .. safeToString(state) ..
     "  | CHEVRONS : " .. safeToString(chevrons))
   print("DIRECTION  : " .. safeToString(direction))
@@ -3238,6 +3964,7 @@ local function main()
   loadTeams()
   loadDefcon()
   loadIntelligence()
+  loadPersonnel()
 
   findGate()
   findAlarm()
@@ -3250,7 +3977,12 @@ local function main()
   -- restée active après un ancien plantage.
   emergencyAlarmStop()
 
-  log("Demarrage du systeme SGC - TABLEAU TACTIQUE + RENSEIGNEMENT")
+  log("Demarrage du systeme SGC - PERSONNEL + DROITS RBAC")
+  securityLog("DEMARRAGE SYSTEME", "INITIALISATION")
+
+  if not loginScreen(false) then
+    return
+  end
 
   if not gate then
     header()
@@ -3288,9 +4020,11 @@ local function main()
     print("11 - Diagnostic complet")
     print("12 - Methodes SGCraft")
     print("13 - Arret d'urgence de l'alarme")
-    print("14 - Sécurité IDC")
+    print("14 - Securite IDC")
     print("15 - Niveaux d'alerte DEFCON")
-    print("16 - Quitter")
+    print("16 - Personnel et droits")
+    print("17 - Changer d'operateur")
+    print("18 - Quitter")
     separator()
     print()
 
@@ -3301,86 +4035,144 @@ local function main()
       incomingConnectionScreen()
 
     elseif choice == "1" then
-      showOperationsCenter()
+      if requirePermission("operations") then
+        securityLog("CONSULTATION", "CENTRE OPERATIONS")
+        showOperationsCenter()
+      end
 
     elseif choice == "2" then
-      local mission = buildMission()
+      if requirePermission("missions") then
+        local mission = buildMission()
 
-      if mission then
-        openGate(mission.destination, mission)
+        if mission then
+          securityLog(
+            "MISSION AUTORISEE",
+            mission.team .. " VERS " ..
+            string.upper(mission.destination)
+          )
+          openGate(mission.destination, mission)
+        end
       end
 
     elseif choice == "3" then
-      header()
-      print("COMPOSITION MANUELLE")
-      separator()
-      print()
-      print("Entre un nom du carnet ou une adresse.")
-      print()
-      io.write("Destination > ")
+      if requirePermission("dial") then
+        header()
+        print("COMPOSITION MANUELLE")
+        separator()
+        print()
+        print("Entre un nom du carnet ou une adresse.")
+        print()
+        io.write("Destination > ")
 
-      local destination = io.read()
-      openGate(destination)
+        local destination = io.read()
+        securityLog(
+          "COMPOSITION MANUELLE",
+          tostring(destination)
+        )
+        openGate(destination)
+      end
 
     elseif choice == "4" then
-      closeGate()
+      if requirePermission("close_gate") then
+        securityLog("FERMETURE PORTE", "COMMANDE")
+        closeGate()
+      end
 
     elseif choice == "5" then
-      irisMenu()
+      if requirePermission("iris") then
+        securityLog("CONTROLE IRIS", "MENU")
+        irisMenu()
+      end
 
     elseif choice == "6" then
-      destinationDatabase()
+      if requirePermission("intelligence_view") then
+        destinationDatabase()
+      end
 
     elseif choice == "7" then
-      showAddressBook()
+      if requirePermission("address_book") then
+        showAddressBook()
+      end
 
     elseif choice == "8" then
-      teamAdministration()
+      if requirePermission("teams") then
+        securityLog("ADMINISTRATION", "EQUIPES SG")
+        teamAdministration()
+      end
 
     elseif choice == "9" then
-      showMissionLogs()
+      if requirePermission("mission_logs") then
+        showMissionLogs()
+      end
 
     elseif choice == "10" then
-      showLogs()
+      if requirePermission("technical_logs") then
+        showLogs()
+      end
 
     elseif choice == "11" then
-      showStatus()
+      if requirePermission("diagnostics") then
+        showStatus()
+      end
 
     elseif choice == "12" then
-      showMethods()
+      if requirePermission("sgcraft_methods") then
+        showMethods()
+      end
 
     elseif choice == "13" then
-      header()
-      emergencyAlarmStop()
+      if requirePermission("alarm_stop") then
+        header()
+        emergencyAlarmStop()
 
-      print("ARRET D'URGENCE")
-      print()
-      print("La commande d'arret de l'alarme")
-      print("a ete envoyee.")
+        print("ARRET D'URGENCE")
+        print()
+        print("La commande d'arret de l'alarme")
+        print("a ete envoyee.")
 
-      log("Arret d'urgence de l'alarme")
-      waitForEnter()
+        securityLog("ARRET ALARME", "URGENCE")
+        log("Arret d'urgence de l'alarme")
+        waitForEnter()
+      end
 
     elseif choice == "14" then
-      showIDCSecurity()
+      if requirePermission("idc") then
+        securityLog("SECURITE IDC", "MENU")
+        showIDCSecurity()
+      end
 
     elseif choice == "15" then
-      showDefconControl()
+      if requirePermission("defcon_view") then
+        showDefconControl()
+      end
 
     elseif choice == "16" then
-      saveTeams()
-      saveDefcon()
-      saveIntelligence()
-      removeIDCListener()
-      removeIncomingListener()
-      emergencyAlarmStop()
-      log("Arret normal du systeme SGC")
+      personnelMenu()
 
-      header()
-      print("Arret du systeme SGC.")
-      print("Donnees des equipes sauvegardees.")
-      print("Alarme securisee.")
-      return
+    elseif choice == "17" then
+      if requirePermission("personnel_switch") then
+        loginScreen(true)
+      end
+
+    elseif choice == "18" then
+      if requirePermission("shutdown") then
+        securityLog("ARRET SYSTEME", "DEMANDE OPERATEUR")
+        saveTeams()
+        saveDefcon()
+        saveIntelligence()
+        saveRoles()
+        saveUsers()
+        removeIDCListener()
+        removeIncomingListener()
+        emergencyAlarmStop()
+        log("Arret normal du systeme SGC")
+
+        header()
+        print("Arret du systeme SGC.")
+        print("Donnees sauvegardees.")
+        print("Alarme securisee.")
+        return
+      end
 
     else
       print()
@@ -3397,6 +4189,12 @@ end
 local function emergencyCleanup(errorMessage)
   saveDefcon()
   saveIntelligence()
+  saveRoles()
+  saveUsers()
+  securityLog(
+    "ARRET SUR ERREUR",
+    safeToString(errorMessage)
+  )
   removeIDCListener()
   removeIncomingListener()
   emergencyAlarmStop()
