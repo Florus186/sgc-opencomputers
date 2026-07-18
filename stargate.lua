@@ -16,6 +16,7 @@ local filesystem = require("filesystem")
 
 local LOG_DIRECTORY = "/home/logs"
 local LOG_FILE = LOG_DIRECTORY .. "/gate.log"
+local MISSION_LOG_FILE = LOG_DIRECTORY .. "/missions.log"
 
 -- Durée maximale autorisée pour une composition
 local DIAL_TIMEOUT = 60
@@ -41,6 +42,53 @@ local ADDRESS_BOOK = {
   Chulak = "FFFK-ZPU-77",
   P4X354 = "645Y-ITQ-KC"
 }
+
+-- Informations tactiques et diplomatiques.
+-- Les clés sont normalisées en minuscules par le programme.
+local DESTINATION_DATA = {
+  terre = {
+    galaxy = "Voie Lactee",
+    status = "BASE PRINCIPALE",
+    threat = "SECURISE",
+    notes = "Stargate Command."
+  },
+  abydos = {
+    galaxy = "Voie Lactee",
+    status = "ALLIE",
+    threat = "FAIBLE",
+    notes = "Monde desertique. Population amicale."
+  },
+  chulak = {
+    galaxy = "Voie Lactee",
+    status = "HOSTILE",
+    threat = "ELEVE",
+    notes = "Ancien monde Goa'uld. Reconnaissance armee conseillee."
+  },
+  p4x354 = {
+    galaxy = "Voie Lactee",
+    status = "NON DETERMINE",
+    threat = "INCONNU",
+    notes = "Donnees insuffisantes."
+  }
+}
+
+-- Equipes disponibles pour les missions hors-monde.
+local SG_TEAMS = {
+  "SG-1",
+  "SG-2",
+  "SG-3",
+  "SG-4"
+}
+
+local MISSION_TYPES = {
+  "Reconnaissance",
+  "Diplomatie",
+  "Exploration",
+  "Secours",
+  "Ravitaillement",
+  "Operation tactique"
+}
+
 
 ------------------------------------------------------------
 -- VARIABLES GLOBALES
@@ -117,6 +165,31 @@ local function log(message)
 
   return true
 end
+
+local function missionLog(message)
+  initializeLog()
+
+  local file, reason = io.open(MISSION_LOG_FILE, "a")
+
+  if not file then
+    log("ERREUR JOURNAL MISSIONS : " .. safeToString(reason))
+    return false, reason
+  end
+
+  local timestamp
+
+  if os.date then
+    timestamp = os.date("%Y-%m-%d %H:%M:%S")
+  else
+    timestamp = "UPTIME " .. math.floor(computer.uptime())
+  end
+
+  file:write("[" .. timestamp .. "] " .. tostring(message) .. "\n")
+  file:close()
+
+  return true
+end
+
 
 ------------------------------------------------------------
 -- AFFICHAGE
@@ -388,311 +461,271 @@ local function irisMenu()
 
     if pendingIncoming then
       incomingConnectionScreen()
+
     elseif choice == "1" then
-      setIris(true)
+      local mission = buildMission()
+
+      if mission then
+        openGate(mission.destination, mission)
+      end
+
     elseif choice == "2" then
-      setIris(false)
+      header()
+      print("COMPOSITION MANUELLE")
+      separator()
+      print()
+      print("Entre un nom du carnet ou une adresse.")
+      print()
+      io.write("Destination > ")
+
+      local destination = io.read()
+      openGate(destination)
+
     elseif choice == "3" then
+      closeGate()
+
+    elseif choice == "4" then
+      irisMenu()
+
+    elseif choice == "5" then
+      destinationDatabase()
+
+    elseif choice == "6" then
+      showAddressBook()
+
+    elseif choice == "7" then
+      showMissionLogs()
+
+    elseif choice == "8" then
+      showLogs()
+
+    elseif choice == "9" then
+      showStatus()
+
+    elseif choice == "10" then
+      showMethods()
+
+    elseif choice == "11" then
+      header()
+      emergencyAlarmStop()
+
+      print("ARRET D'URGENCE")
+      print()
+      print("La commande d'arret de l'alarme")
+      print("a ete envoyee.")
+
+      log("Arret d'urgence de l'alarme")
+      waitForEnter()
+
+    elseif choice == "12" then
+      removeIncomingListener()
+      emergencyAlarmStop()
+      log("Arret normal du systeme SGC")
+
+      header()
+      print("Arret du systeme SGC.")
+      print("Alarme securisee.")
       return
+
     else
+      print()
       print("Commande inconnue.")
       pause(1)
     end
   end
 end
 
-local function getDialCost(address)
-  if not gate or not gate.energyToDial then
-    return nil, "Methode energyToDial indisponible"
-  end
+local function getDestinationInfo(name)
+  local normalized = normalizeName(name)
+  local data = DESTINATION_DATA[normalized] or {}
 
-  local ok, value = pcall(gate.energyToDial, address)
-
-  if not ok then
-    return nil, value
-  end
-
-  return tonumber(value), nil
-end
-
-------------------------------------------------------------
--- NORMALISATION DES ADRESSES
-------------------------------------------------------------
-
-local function normalizeAddress(address)
-  address = tostring(address or "")
-
-  -- Retire espaces, tabulations et retours à la ligne
-  address = address:gsub("%s+", "")
-
-  -- Retire les tirets pour accepter ABC-DEF-G
-  address = address:gsub("%-", "")
-
-  address = address:upper()
-
-  return address
-end
-
-local function normalizeName(name)
-  name = tostring(name or ""):lower()
-  name = name:gsub("^%s+", "")
-  name = name:gsub("%s+$", "")
-  return name
-end
-
-local function resolveDestination(input)
-  local requestedName = normalizeName(input)
-
-  for savedName, savedAddress in pairs(ADDRESS_BOOK) do
-    if normalizeName(savedName) == requestedName then
-      return normalizeAddress(savedAddress),
-             normalizeName(savedName)
-    end
-  end
-
-  return normalizeAddress(input), nil
-end
-
-local function findDestinationByAddress(rawAddress)
-  local searched = normalizeAddress(rawAddress)
-
-  if searched == "" then
-    return nil
-  end
-
-  for savedName, savedAddress in pairs(ADDRESS_BOOK) do
-    if normalizeAddress(savedAddress) == searched then
-      return tostring(savedName)
-    end
-  end
-
-  return nil
-end
-
-local function closeIrisImmediately()
-  if not gate or not gate.closeIris then
-    return false, "Commande closeIris indisponible"
-  end
-
-  local ok, result, reason = pcall(gate.closeIris)
-
-  if not ok then
-    return false, result
-  end
-
-  if result == nil then
-    return false, reason
-  end
-
-  return true
-end
-
-local function incomingEventHandler(_, source, remoteAddress)
-  if source ~= gateAddress then
-    return
-  end
-
-  local address = normalizeAddress(remoteAddress or "")
-  local knownName = findDestinationByAddress(address)
-
-  pendingIncoming = {
-    address = address,
-    name = knownName,
-    detectedAt = computer.uptime(),
-    irisCommandSent = false,
-    irisError = nil
+  return {
+    galaxy = data.galaxy or "INCONNUE",
+    status = data.status or "NON DETERMINE",
+    threat = data.threat or "INCONNU",
+    notes = data.notes or "Aucune note disponible."
   }
-
-  if AUTO_CLOSE_IRIS_ON_INCOMING then
-    local ok, reason = closeIrisImmediately()
-    pendingIncoming.irisCommandSent = ok
-    pendingIncoming.irisError = reason
-  end
-
-  if INCOMING_ALARM then
-    siren(true)
-  end
-
-  computer.beep(900, 0.15)
-  computer.beep(700, 0.15)
-  computer.beep(900, 0.15)
-
-  log(
-    "Connexion entrante depuis " ..
-    (knownName and string.upper(knownName) or "ORIGINE INCONNUE") ..
-    " [" .. safeToString(address) .. "]"
-  )
 end
 
-local function installIncomingListener()
-  if incomingListenerInstalled then
-    return true
+local function sortedDestinationNames()
+  local names = {}
+
+  for name in pairs(ADDRESS_BOOK) do
+    table.insert(names, tostring(name))
   end
 
-  local ok, reason =
-    event.listen("sgDialIn", incomingEventHandler)
+  table.sort(names, function(a, b)
+    return normalizeName(a) < normalizeName(b)
+  end)
 
-  if ok then
-    incomingListenerInstalled = true
-    return true
-  end
-
-  log("Impossible d'installer l'ecoute sgDialIn : " ..
-    safeToString(reason))
-
-  return false, reason
+  return names
 end
 
-local function removeIncomingListener()
-  if incomingListenerInstalled then
-    pcall(event.ignore, "sgDialIn", incomingEventHandler)
-    incomingListenerInstalled = false
-  end
-end
+local function showDestinationFile(name)
+  local address, resolvedName = resolveDestination(name)
 
-local function waitForIrisState(expected, timeoutSeconds)
-  local timeout = computer.uptime() + (timeoutSeconds or 10)
-
-  while computer.uptime() < timeout do
-    if getIrisState() == expected then
-      return true
-    end
-
-    os.sleep(0.20)
-  end
-
-  return false
-end
-
-local function incomingConnectionScreen()
-  if not pendingIncoming then
+  if not resolvedName then
+    header()
+    print("DESTINATION INCONNUE")
+    waitForEnter()
     return
   end
 
-  local incoming = pendingIncoming
-  pendingIncoming = nil
+  local info = getDestinationInfo(resolvedName)
 
-  -- remoteAddress() peut devenir disponible un peu après sgDialIn.
-  if not incoming.address or incoming.address == "" then
-    local timeout = computer.uptime() + 5
+  header()
+  print("DOSSIER DE DESTINATION")
+  separator()
+  print("CODE     : " .. string.upper(resolvedName))
+  print("ADRESSE  : " .. address)
+  print("GALAXIE  : " .. info.galaxy)
+  print("STATUT   : " .. info.status)
+  print("MENACE   : " .. info.threat)
+  print()
+  print("NOTES")
+  separator()
+  print(info.notes)
+  waitForEnter()
+end
 
-    while computer.uptime() < timeout do
-      incoming.address = getRemoteAddress()
-
-      if incoming.address and incoming.address ~= "" then
-        break
-      end
-
-      os.sleep(0.20)
-    end
-  end
-
-  incoming.address = normalizeAddress(incoming.address or "")
-  incoming.name =
-    incoming.name or findDestinationByAddress(incoming.address)
-
+local function destinationDatabase()
   while true do
     header()
-    print("********************************")
-    print("    ALERTE PORTE ENTRANTE")
-    print("********************************")
-    print()
-
-    if incoming.name then
-      print("ORIGINE : " .. string.upper(incoming.name))
-    else
-      print("ORIGINE : INCONNUE")
-    end
-
-    print("ADRESSE : " ..
-      (incoming.address ~= "" and incoming.address or "NON RECUE"))
-
-    local state, chevrons, direction = getGateState()
-
-    print("ETAT    : " .. safeToString(state))
-    print("CHEVRONS: " .. safeToString(chevrons))
-    print("SENS    : " .. safeToString(direction))
-    print("IRIS    : " .. safeToString(getIrisState()))
-    print()
-
-    if incoming.irisError then
-      print("ATTENTION : fermeture automatique")
-      print("de l'iris non confirmee.")
-      print("Detail : " .. safeToString(incoming.irisError))
-      print()
-    end
-
-    if state == "Idle" or state == "Offline" then
-      emergencyAlarmStop()
-      print("La connexion entrante est terminee.")
-      log("Fin de connexion entrante [" ..
-        safeToString(incoming.address) .. "]")
-      waitForEnter()
-      return
-    end
-
+    print("BASE DE DONNEES PLANETAIRES")
     separator()
-    print("1 - Ouvrir l'iris")
-    print("2 - Maintenir l'iris ferme")
-    print("3 - Fermer la connexion")
-    print("4 - Actualiser")
-    separator()
+
+    local names = sortedDestinationNames()
+
+    for index, name in ipairs(names) do
+      local info = getDestinationInfo(name)
+      print(
+        tostring(index) .. " - " ..
+        string.upper(name) .. " [" ..
+        info.status .. " / " .. info.threat .. "]"
+      )
+    end
+
     print()
-    io.write("Decision SGC > ")
+    print("0 - Retour")
+    print()
+    io.write("Dossier > ")
 
     local choice = io.read()
 
-    if choice == "1" then
-      local ok, result, reason = pcall(gate.openIris)
+    if choice == "0" then
+      return
+    end
 
-      if not ok or result == nil then
-        print()
-        print("ECHEC D'OUVERTURE : " ..
-          safeToString(ok and reason or result))
-        pause(2)
-      else
-        waitForIrisState("Open", 10)
-        emergencyAlarmStop()
-        log("Iris ouvert pour connexion entrante depuis " ..
-          safeToString(incoming.address))
-      end
+    local index = tonumber(choice)
 
-    elseif choice == "2" then
-      closeIrisImmediately()
-      emergencyAlarmStop()
-      log("Iris maintenu ferme pour connexion entrante depuis " ..
-        safeToString(incoming.address))
-      print()
-      print("IRIS MAINTENU FERME")
-      print("Surveillance de la connexion...")
-      pause(1)
-
-    elseif choice == "3" then
-      local ok, result, reason = pcall(gate.disconnect)
-
-      emergencyAlarmStop()
-
-      if not ok or result == nil then
-        print()
-        print("ECHEC DE DECONNEXION : " ..
-          safeToString(ok and reason or result))
-        pause(2)
-      else
-        log("Connexion entrante fermee manuellement depuis " ..
-          safeToString(incoming.address))
-        print()
-        print("Commande de fermeture envoyee.")
-        pause(1)
-      end
-
-    elseif choice == "4" then
-      -- Le prochain passage de boucle réaffiche les données.
+    if index and names[index] then
+      showDestinationFile(names[index])
     else
-      print()
-      print("Commande inconnue.")
+      print("Selection inconnue.")
       pause(1)
     end
   end
+end
+
+local function selectFromList(title, values)
+  while true do
+    header()
+    print(title)
+    separator()
+
+    for index, value in ipairs(values) do
+      print(tostring(index) .. " - " .. tostring(value))
+    end
+
+    print()
+    print("0 - Annuler")
+    print()
+    io.write("Selection > ")
+
+    local choice = io.read()
+
+    if choice == "0" then
+      return nil
+    end
+
+    local index = tonumber(choice)
+
+    if index and values[index] then
+      return values[index]
+    end
+
+    print("Selection inconnue.")
+    pause(1)
+  end
+end
+
+local function selectDestination()
+  local names = sortedDestinationNames()
+  local selected = selectFromList("SELECTION DE LA DESTINATION", names)
+
+  if not selected then
+    return nil
+  end
+
+  return normalizeName(selected)
+end
+
+local function buildMission()
+  local destination = selectDestination()
+
+  if not destination then
+    return nil
+  end
+
+  local team = selectFromList("SELECTION DE L'EQUIPE", SG_TEAMS)
+
+  if not team then
+    return nil
+  end
+
+  local missionType =
+    selectFromList("TYPE DE MISSION", MISSION_TYPES)
+
+  if not missionType then
+    return nil
+  end
+
+  local info = getDestinationInfo(destination)
+  local address = select(1, resolveDestination(destination))
+
+  header()
+  print("AUTORISATION DE MISSION")
+  separator()
+  print("DESTINATION : " .. string.upper(destination))
+  print("ADRESSE     : " .. address)
+  print("EQUIPE      : " .. team)
+  print("MISSION     : " .. missionType)
+  print("STATUT      : " .. info.status)
+  print("MENACE      : " .. info.threat)
+  print()
+  print("1 - Autoriser et composer")
+  print("2 - Annuler")
+  print()
+  io.write("Autorisation > ")
+
+  if io.read() ~= "1" then
+    missionLog(
+      "MISSION ANNULEE | " .. team ..
+      " | " .. string.upper(destination) ..
+      " | " .. missionType
+    )
+    return nil
+  end
+
+  return {
+    destination = destination,
+    address = address,
+    team = team,
+    missionType = missionType,
+    status = info.status,
+    threat = info.threat,
+    startedAt = computer.uptime()
+  }
 end
 
 local function showAddressBook()
@@ -700,13 +733,7 @@ local function showAddressBook()
   print("CARNET D'ADRESSES")
   separator()
 
-  local names = {}
-
-  for name in pairs(ADDRESS_BOOK) do
-    table.insert(names, name)
-  end
-
-  table.sort(names)
+  local names = sortedDestinationNames()
 
   if #names == 0 then
     print("Le carnet est vide.")
@@ -785,7 +812,7 @@ end
 -- OUVERTURE DE LA PORTE
 ------------------------------------------------------------
 
-local function openGate(rawAddress)
+local function openGate(rawAddress, mission)
   header()
 
   local address, destinationName = resolveDestination(rawAddress)
@@ -841,6 +868,13 @@ local function openGate(rawAddress)
   else
     print("DESTINATION : " .. address)
   end
+
+  if mission then
+    print("EQUIPE      : " .. mission.team)
+    print("MISSION     : " .. mission.missionType)
+    print("MENACE      : " .. mission.threat)
+  end
+
   separator()
   print("Verification de l'adresse...")
 
@@ -895,6 +929,16 @@ local function openGate(rawAddress)
   siren(true)
 
   log("Debut de composition vers " .. address)
+
+  if mission then
+    missionLog(
+      "DEPART AUTORISE | " .. mission.team ..
+      " | " .. string.upper(mission.destination) ..
+      " [" .. address .. "]" ..
+      " | " .. mission.missionType ..
+      " | MENACE " .. mission.threat
+    )
+  end
 
   print("Lancement de la sequence...")
 
@@ -1007,6 +1051,14 @@ local function openGate(rawAddress)
 
     log("Connexion etablie vers " .. address)
 
+    if mission then
+      missionLog(
+        "VORTEX STABILISE | " .. mission.team ..
+        " | " .. string.upper(mission.destination) ..
+        " | " .. mission.missionType
+      )
+    end
+
     waitForEnter()
     return true
   end
@@ -1024,6 +1076,14 @@ local function openGate(rawAddress)
   log("Composition non aboutie vers " ..
     address .. ", dernier etat : " ..
     safeToString(finalState))
+
+  if mission then
+    missionLog(
+      "ECHEC DEPART | " .. mission.team ..
+      " | " .. string.upper(mission.destination) ..
+      " | ETAT " .. safeToString(finalState)
+    )
+  end
 
   waitForEnter()
   return false
@@ -1139,6 +1199,44 @@ local function showLogs()
   waitForEnter()
 end
 
+local function showMissionLogs()
+  header()
+  print("JOURNAL DES MISSIONS")
+  separator()
+
+  initializeLog()
+
+  local file = io.open(MISSION_LOG_FILE, "r")
+
+  if not file then
+    print("Aucune mission enregistree.")
+    waitForEnter()
+    return
+  end
+
+  local lines = {}
+
+  for line in file:lines() do
+    table.insert(lines, line)
+
+    if #lines > 15 then
+      table.remove(lines, 1)
+    end
+  end
+
+  file:close()
+
+  if #lines == 0 then
+    print("Le journal des missions est vide.")
+  else
+    for _, line in ipairs(lines) do
+      print(line)
+    end
+  end
+
+  waitForEnter()
+end
+
 ------------------------------------------------------------
 -- DIAGNOSTIC DES MÉTHODES
 ------------------------------------------------------------
@@ -1240,15 +1338,18 @@ local function main()
 
     print()
     separator()
-    print("1 - Composer une destination")
-    print("2 - Fermer la porte")
-    print("3 - Controler l'iris")
-    print("4 - Carnet d'adresses")
-    print("5 - Diagnostic complet")
-    print("6 - Consulter le journal")
-    print("7 - Afficher les methodes SGCraft")
-    print("8 - Arret d'urgence de l'alarme")
-    print("9 - Quitter")
+    print("1 - Autoriser une mission SG")
+    print("2 - Composition manuelle")
+    print("3 - Fermer la porte")
+    print("4 - Controler l'iris")
+    print("5 - Base de donnees planetaires")
+    print("6 - Carnet d'adresses")
+    print("7 - Journal des missions")
+    print("8 - Journal technique")
+    print("9 - Diagnostic complet")
+    print("10 - Methodes SGCraft")
+    print("11 - Arret d'urgence de l'alarme")
+    print("12 - Quitter")
     separator()
     print()
 
