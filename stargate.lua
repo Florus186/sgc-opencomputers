@@ -19,6 +19,8 @@ local LOG_FILE = LOG_DIRECTORY .. "/gate.log"
 local MISSION_LOG_FILE = LOG_DIRECTORY .. "/missions.log"
 local DATA_DIRECTORY = "/home/sgc"
 local TEAM_DATABASE_FILE = DATA_DIRECTORY .. "/teams.db"
+local DEFCON_DATABASE_FILE = DATA_DIRECTORY .. "/defcon.db"
+local DEFCON_LOG_FILE = LOG_DIRECTORY .. "/defcon.log"
 
 -- Durée maximale autorisée pour une composition
 local DIAL_TIMEOUT = 60
@@ -38,7 +40,7 @@ local INCOMING_ALARM = true
 -- Système IDC.
 -- Matériel recommandé : une paire de Linked Cards OpenComputers.
 -- Le programme accepte aussi une carte réseau sur le port indiqué.
-local IDC_ENABLED = true
+local IDC_ENABLED = false
 local IDC_NETWORK_PORT = 1701
 local IDC_SECURITY_MODE = "CONFIRMATION"
 -- Modes possibles :
@@ -130,6 +132,8 @@ local teamState = {}
 -- Déclarations anticipées, définies plus bas.
 local normalizeAddress
 local waitForIrisState
+local siren
+local closeIrisImmediately
 
 -- Communication IDC : Linked Card ("tunnel") ou carte réseau ("modem").
 local idcTransport = nil
@@ -137,6 +141,17 @@ local idcTransportType = nil
 local idcListenerInstalled = false
 local latestIDC = nil
 local idcFailureCount = 0
+
+local DEFCON_LEVELS = {
+  VERT = 1,
+  JAUNE = 2,
+  ROUGE = 3,
+  NOIR = 4
+}
+
+local defconLevel = "VERT"
+local defconReason = "Situation normale"
+local defconChangedAt = 0
 
 ------------------------------------------------------------
 -- OUTILS
@@ -263,6 +278,141 @@ local function missionLog(message)
 
   return true
 end
+
+local function defconTimestamp()
+  if os.date then
+    return os.date("%Y-%m-%d %H:%M:%S")
+  end
+
+  return "UPTIME " .. math.floor(computer.uptime())
+end
+
+local function defconLog(message)
+  initializeLog()
+
+  local file = io.open(DEFCON_LOG_FILE, "a")
+
+  if file then
+    file:write("[" .. defconTimestamp() .. "] " ..
+      tostring(message) .. "\n")
+    file:close()
+  end
+end
+
+local function saveDefcon()
+  if not filesystem.exists(DATA_DIRECTORY) then
+    filesystem.makeDirectory(DATA_DIRECTORY)
+  end
+
+  local file = io.open(DEFCON_DATABASE_FILE, "w")
+
+  if not file then
+    log("Impossible de sauvegarder l'état DEFCON")
+    return false
+  end
+
+  file:write("level=" .. tostring(defconLevel) .. "\n")
+  file:write("reason=" ..
+    tostring(defconReason):gsub("\n", " ") .. "\n")
+  file:write("changedAt=" ..
+    tostring(defconChangedAt or 0) .. "\n")
+  file:write("idcFailures=" ..
+    tostring(idcFailureCount or 0) .. "\n")
+  file:close()
+  return true
+end
+
+local function loadDefcon()
+  local file = io.open(DEFCON_DATABASE_FILE, "r")
+
+  if not file then
+    defconLevel = "VERT"
+    defconReason = "Situation normale"
+    defconChangedAt = currentTimestamp()
+    idcFailureCount = 0
+    saveDefcon()
+    return
+  end
+
+  for line in file:lines() do
+    local key, value = line:match("^([^=]+)=(.*)$")
+
+    if key == "level" and DEFCON_LEVELS[value] then
+      defconLevel = value
+    elseif key == "reason" and value ~= "" then
+      defconReason = value
+    elseif key == "changedAt" then
+      defconChangedAt = tonumber(value) or 0
+    elseif key == "idcFailures" then
+      idcFailureCount = tonumber(value) or 0
+    end
+  end
+
+  file:close()
+end
+
+local function defconAtLeast(level)
+  return (DEFCON_LEVELS[defconLevel] or 1) >=
+    (DEFCON_LEVELS[level] or 1)
+end
+
+local function setDefcon(level, reason, source)
+  level = tostring(level or ""):upper()
+
+  if not DEFCON_LEVELS[level] then
+    return false, "Niveau DEFCON inconnu"
+  end
+
+  local previous = defconLevel
+  defconLevel = level
+  defconReason = tostring(reason or "Aucun motif communiqué")
+  defconChangedAt = currentTimestamp()
+
+  local message =
+    "DEFCON " .. previous .. " -> " .. defconLevel ..
+    " | " .. defconReason ..
+    " | SOURCE " .. tostring(source or "OPERATEUR")
+
+  defconLog(message)
+  missionLog(message)
+  log(message)
+  saveDefcon()
+
+  if defconLevel == "ROUGE" then
+    IDC_SECURITY_MODE = "CONFIRMATION"
+  elseif defconLevel == "NOIR" then
+    IDC_SECURITY_MODE = "VERROUILLE"
+
+    if closeIrisImmediately then
+      closeIrisImmediately()
+    end
+
+    if siren then
+      siren(true)
+    end
+  end
+
+  return true
+end
+
+local function registerSecurityIncident(reason, severity)
+  severity = tostring(severity or "JAUNE"):upper()
+
+  if severity == "NOIR" then
+    setDefcon("NOIR", reason, "AUTOMATIQUE")
+  elseif severity == "ROUGE" then
+    if not defconAtLeast("ROUGE") then
+      setDefcon("ROUGE", reason, "AUTOMATIQUE")
+    else
+      defconLog("INCIDENT ROUGE | " .. tostring(reason))
+    end
+  elseif not defconAtLeast("JAUNE") then
+    setDefcon("JAUNE", reason, "AUTOMATIQUE")
+  else
+    defconLog("INCIDENT | " .. tostring(reason))
+  end
+end
+
 
 local function ensureDataDirectory()
   if not filesystem.exists(DATA_DIRECTORY) then
@@ -426,6 +576,16 @@ local function header()
   print("================================")
   print("          SGC CONTROL")
   print("   STARGATE COMMAND SYSTEM")
+  print("--------------------------------")
+
+  if defconLevel == "ROUGE" then
+    print("      *** ALERTE ROUGE ***")
+  elseif defconLevel == "NOIR" then
+    print("      !!! ALERTE NOIRE !!!")
+  else
+    print("      ALERTE : " .. defconLevel)
+  end
+
   print("================================")
   print()
 end
@@ -486,7 +646,7 @@ end
 -- CONTRÔLE DE L'ALARME
 ------------------------------------------------------------
 
-local function siren(enabled)
+siren = function(enabled)
   if not alarm then
     alarmActive = false
     return false, "Aucune alarme detectee"
@@ -827,6 +987,24 @@ local function recordIDCIncident(message)
   )
 
   log("INCIDENT IDC : " .. tostring(message))
+  saveDefcon()
+
+  if idcFailureCount >= 3 then
+    registerSecurityIncident(
+      "Trois tentatives IDC invalides : " .. tostring(message),
+      "NOIR"
+    )
+  elseif idcFailureCount >= 2 then
+    registerSecurityIncident(
+      "Deux tentatives IDC invalides : " .. tostring(message),
+      "ROUGE"
+    )
+  else
+    registerSecurityIncident(
+      "Tentative IDC invalide : " .. tostring(message),
+      "JAUNE"
+    )
+  end
 end
 
 local function validateIDC(team, code, originAddress)
@@ -859,6 +1037,10 @@ local function validateIDC(team, code, originAddress)
 end
 
 local function openIrisForValidatedIDC(team, mission)
+  if defconLevel == "NOIR" then
+    return false, "DEFCON NOIR : iris verrouillée"
+  end
+
   if IDC_SECURITY_MODE == "VERROUILLE" then
     return false, "Mode verrouillé"
   end
@@ -923,6 +1105,7 @@ local function idcMessageHandler(
   end
 
   idcFailureCount = 0
+  saveDefcon()
 
   missionLog(
     "IDC RECU | " .. team ..
@@ -1002,7 +1185,7 @@ local function getIDCForMission(mission, incomingAddress)
   return latestIDC
 end
 
-local function closeIrisImmediately()
+closeIrisImmediately = function()
   if not gate or not gate.closeIris then
     return false, "Commande closeIris indisponible"
   end
@@ -1357,6 +1540,12 @@ local function incomingConnectionScreen()
           " | " .. safeToString(incoming.address)
         )
 
+        registerSecurityIncident(
+          "Ouverture forcée sans IDC pour " ..
+          incoming.returnMission.team,
+          "ROUGE"
+        )
+
         completeReturn(incoming.returnMission)
         return
       end
@@ -1407,6 +1596,11 @@ local function incomingConnectionScreen()
         missionLog(
           "OUVERTURE MANUELLE ORIGINE NON AUTHENTIFIEE | " ..
           safeToString(incoming.address)
+        )
+
+        registerSecurityIncident(
+          "Iris ouverte pour une origine non authentifiée",
+          "ROUGE"
         )
       end
 
@@ -2205,14 +2399,108 @@ local function teamAdministration()
   end
 end
 
+local function showDefconControl()
+  while true do
+    header()
+    print("CONTROLE DES NIVEAUX D'ALERTE")
+    separator()
+    print("Niveau actuel : " .. defconLevel)
+    print("Motif         : " .. defconReason)
+    print("Echecs IDC    : " .. tostring(idcFailureCount))
+    print()
+    print("VERT  : fonctionnement normal")
+    print("JAUNE : confirmation renforcée")
+    print("ROUGE : départs et compositions interdits")
+    print("NOIR  : verrouillage de la base et de l'iris")
+    print()
+    separator()
+    print("1 - Passer au niveau VERT")
+    print("2 - Passer au niveau JAUNE")
+    print("3 - Passer au niveau ROUGE")
+    print("4 - Passer au niveau NOIR")
+    print("5 - Consulter le journal DEFCON")
+    print("0 - Retour")
+    separator()
+    print()
+    io.write("Choix > ")
+
+    local choice = io.read()
+
+    if choice == "0" then
+      return
+    elseif choice == "5" then
+      header()
+      print("JOURNAL DEFCON")
+      separator()
+
+      local file = io.open(DEFCON_LOG_FILE, "r")
+
+      if not file then
+        print("Le journal DEFCON est vide.")
+      else
+        local lines = {}
+
+        for line in file:lines() do
+          table.insert(lines, line)
+
+          if #lines > 30 then
+            table.remove(lines, 1)
+          end
+        end
+
+        file:close()
+
+        for _, line in ipairs(lines) do
+          print(line)
+        end
+      end
+
+      waitForEnter()
+    else
+      local requested = ({
+        ["1"] = "VERT",
+        ["2"] = "JAUNE",
+        ["3"] = "ROUGE",
+        ["4"] = "NOIR"
+      })[choice]
+
+      if not requested then
+        print("Choix inconnu.")
+        pause(1)
+      else
+        print()
+        io.write("Motif du changement > ")
+        local reason = io.read()
+
+        if requested == "VERT" and defconLevel ~= "VERT" then
+          print()
+          print("Retour au VERT : tape CONFIRMER")
+          io.write("> ")
+
+          if io.read() ~= "CONFIRMER" then
+            print("Changement annulé.")
+            pause(1)
+          else
+            idcFailureCount = 0
+            IDC_SECURITY_MODE = "CONFIRMATION"
+            emergencyAlarmStop()
+            setDefcon("VERT", reason, "OPERATEUR")
+          end
+        else
+          setDefcon(requested, reason, "OPERATEUR")
+        end
+      end
+    end
+  end
+end
+
 local function showIDCSecurity()
   while true do
     header()
     print("SECURITE IDC")
     separator()
-    print("Transport : " ..
-      safeToString(idcTransportType or "NON DETECTE"))
-    print("Port      : " .. tostring(IDC_NETWORK_PORT))
+    print("Transmission distante : DESACTIVEE")
+    print("Saisie IDC             : CONSOLE SGC")
     print("Mode      : " .. IDC_SECURITY_MODE)
     print("Incidents : " .. tostring(idcFailureCount))
     print()
@@ -2339,13 +2627,13 @@ end
 local function main()
   initializeLog()
   loadTeams()
+  loadDefcon()
 
   findGate()
   findAlarm()
 
   if gate then
     installIncomingListener()
-    installIDCListener()
   end
 
   -- Au démarrage, on arrête une éventuelle alarme
@@ -2382,6 +2670,8 @@ local function main()
     local localAddress = getLocalAddress()
     local remoteAddress = getRemoteAddress()
 
+    print("ALERTE   : " .. defconLevel)
+    print("MOTIF    : " .. defconReason)
     print("PORTE    : " .. safeToString(state))
     print("CHEVRONS : " .. safeToString(chevrons))
     print("DIRECTION: " .. safeToString(direction))
@@ -2418,7 +2708,8 @@ local function main()
     print("12 - Methodes SGCraft")
     print("13 - Arret d'urgence de l'alarme")
     print("14 - Sécurité IDC")
-    print("15 - Quitter")
+    print("15 - Niveaux d'alerte DEFCON")
+    print("16 - Quitter")
     separator()
     print()
 
@@ -2493,7 +2784,11 @@ local function main()
       showIDCSecurity()
 
     elseif choice == "15" then
+      showDefconControl()
+
+    elseif choice == "16" then
       saveTeams()
+      saveDefcon()
       removeIDCListener()
       removeIncomingListener()
       emergencyAlarmStop()
@@ -2518,6 +2813,7 @@ end
 ------------------------------------------------------------
 
 local function emergencyCleanup(errorMessage)
+  saveDefcon()
   removeIDCListener()
   removeIncomingListener()
   emergencyAlarmStop()
