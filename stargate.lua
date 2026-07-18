@@ -140,6 +140,9 @@ local siren
 local closeIrisImmediately
 local recordPlanetVisit
 local recordPlanetReturn
+local ensureDataDirectory
+local header
+local separator
 
 -- Communication IDC : Linked Card ("tunnel") ou carte réseau ("modem").
 local idcTransport = nil
@@ -1142,7 +1145,7 @@ local function registerSecurityIncident(reason, severity)
 end
 
 
-local function ensureDataDirectory()
+ensureDataDirectory = function()
   if not filesystem.exists(DATA_DIRECTORY) then
     filesystem.makeDirectory(DATA_DIRECTORY)
   end
@@ -1306,7 +1309,7 @@ end
 -- AFFICHAGE
 ------------------------------------------------------------
 
-local function header()
+header = function()
   clear()
 
   printColored("================================", UI_COLORS.title)
@@ -1343,7 +1346,7 @@ local function header()
   print()
 end
 
-local function separator()
+separator = function()
   print("--------------------------------")
 end
 
@@ -3960,6 +3963,10 @@ end
 ------------------------------------------------------------
 
 local function main()
+  clear()
+  print("Initialisation du systeme SGC...")
+  print()
+
   initializeLog()
   loadTeams()
   loadDefcon()
@@ -4187,17 +4194,18 @@ end
 ------------------------------------------------------------
 
 local function emergencyCleanup(errorMessage)
-  saveDefcon()
-  saveIntelligence()
-  saveRoles()
-  saveUsers()
-  securityLog(
+  pcall(saveDefcon)
+  pcall(saveIntelligence)
+  pcall(saveRoles)
+  pcall(saveUsers)
+  pcall(
+    securityLog,
     "ARRET SUR ERREUR",
     safeToString(errorMessage)
   )
-  removeIDCListener()
-  removeIncomingListener()
-  emergencyAlarmStop()
+  pcall(removeIDCListener)
+  pcall(removeIncomingListener)
+  pcall(emergencyAlarmStop)
 
   print()
   print("================================")
