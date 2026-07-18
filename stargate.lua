@@ -59,7 +59,7 @@ local IDC_CODES = {
 local ADDRESS_BOOK = {
   Terre = "ZFVS-MY6-DJ",
   Abydos = "BFVG-A4I-W7",
-  Chulak = "FFFK-ZPU-77",
+  Chulak = "3FF2-BPI-ER",
   P4X354 = "645Y-ITQ-KC"
 }
 
