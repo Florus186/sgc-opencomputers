@@ -17,6 +17,8 @@ local filesystem = require("filesystem")
 local LOG_DIRECTORY = "/home/logs"
 local LOG_FILE = LOG_DIRECTORY .. "/gate.log"
 local MISSION_LOG_FILE = LOG_DIRECTORY .. "/missions.log"
+local DATA_DIRECTORY = "/home/sgc"
+local TEAM_DATABASE_FILE = DATA_DIRECTORY .. "/teams.db"
 
 -- Durée maximale autorisée pour une composition
 local DIAL_TIMEOUT = 60
@@ -104,6 +106,12 @@ local alarmActive = false
 local pendingIncoming = nil
 local incomingListenerInstalled = false
 
+-- Etat persistant des equipes SG.
+local teamState = {}
+
+-- Déclaration anticipée, définie plus bas.
+local normalizeAddress
+
 ------------------------------------------------------------
 -- OUTILS
 ------------------------------------------------------------
@@ -129,6 +137,43 @@ local function safeToString(value)
   end
 
   return tostring(value)
+end
+
+local function currentTimestamp()
+  local value = nil
+
+  if os.time then
+    local ok, result = pcall(os.time)
+
+    if ok then
+      value = tonumber(result)
+    end
+  end
+
+  if value then
+    if value > 100000000000 then
+      value = math.floor(value / 1000)
+    end
+
+    return math.floor(value)
+  end
+
+  return math.floor(computer.uptime())
+end
+
+local function formatDuration(seconds)
+  seconds = math.max(0, math.floor(tonumber(seconds) or 0))
+
+  local hours = math.floor(seconds / 3600)
+  local minutes = math.floor((seconds % 3600) / 60)
+  local remaining = seconds % 60
+
+  return string.format(
+    "%02d:%02d:%02d",
+    hours,
+    minutes,
+    remaining
+  )
 end
 
 ------------------------------------------------------------
@@ -191,6 +236,158 @@ local function missionLog(message)
   file:close()
 
   return true
+end
+
+local function ensureDataDirectory()
+  if not filesystem.exists(DATA_DIRECTORY) then
+    filesystem.makeDirectory(DATA_DIRECTORY)
+  end
+end
+
+local function defaultTeamRecord(team)
+  return {
+    team = team,
+    status = "DISPONIBLE",
+    destination = "",
+    address = "",
+    missionType = "",
+    startedAt = 0
+  }
+end
+
+local function initializeTeams()
+  for _, team in ipairs(SG_TEAMS) do
+    if not teamState[team] then
+      teamState[team] = defaultTeamRecord(team)
+    end
+  end
+end
+
+local function saveTeams()
+  ensureDataDirectory()
+  initializeTeams()
+
+  local file, reason = io.open(TEAM_DATABASE_FILE, "w")
+
+  if not file then
+    log("ERREUR SAUVEGARDE EQUIPES : " ..
+      safeToString(reason))
+    return false, reason
+  end
+
+  for _, team in ipairs(SG_TEAMS) do
+    local record = teamState[team]
+
+    file:write(
+      team .. "\t" ..
+      safeToString(record.status) .. "\t" ..
+      safeToString(record.destination) .. "\t" ..
+      safeToString(record.address) .. "\t" ..
+      safeToString(record.missionType) .. "\t" ..
+      tostring(tonumber(record.startedAt) or 0) ..
+      "\n"
+    )
+  end
+
+  file:close()
+  return true
+end
+
+local function loadTeams()
+  initializeTeams()
+  ensureDataDirectory()
+
+  local file = io.open(TEAM_DATABASE_FILE, "r")
+
+  if not file then
+    saveTeams()
+    return
+  end
+
+  for line in file:lines() do
+    local team, status, destination, address,
+      missionType, startedAt =
+      line:match(
+        "^([^\t]*)\t([^\t]*)\t([^\t]*)\t" ..
+        "([^\t]*)\t([^\t]*)\t([^\t]*)$"
+      )
+
+    if team and teamState[team] then
+      teamState[team] = {
+        team = team,
+        status = status ~= "" and status or "DISPONIBLE",
+        destination = destination or "",
+        address = address or "",
+        missionType = missionType or "",
+        startedAt = tonumber(startedAt) or 0
+      }
+    end
+  end
+
+  file:close()
+  saveTeams()
+end
+
+local function setTeamAvailable(team)
+  if not teamState[team] then
+    return false
+  end
+
+  teamState[team] = defaultTeamRecord(team)
+  saveTeams()
+  return true
+end
+
+local function setTeamOnMission(mission)
+  if not mission or not mission.team then
+    return false
+  end
+
+  teamState[mission.team] = {
+    team = mission.team,
+    status = "EN MISSION",
+    destination = mission.destination or "",
+    address = mission.address or "",
+    missionType = mission.missionType or "",
+    startedAt = currentTimestamp()
+  }
+
+  saveTeams()
+  return true
+end
+
+local function findMissionByAddress(address)
+  local wanted = normalizeAddress(address or "")
+
+  if wanted == "" then
+    return nil
+  end
+
+  for _, team in ipairs(SG_TEAMS) do
+    local record = teamState[team]
+
+    if record
+       and record.status == "EN MISSION"
+       and normalizeAddress(record.address or "") == wanted then
+      return record
+    end
+  end
+
+  return nil
+end
+
+local function availableTeams()
+  local values = {}
+
+  for _, team in ipairs(SG_TEAMS) do
+    local record = teamState[team]
+
+    if not record or record.status == "DISPONIBLE" then
+      table.insert(values, team)
+    end
+  end
+
+  return values
 end
 
 ------------------------------------------------------------
@@ -494,7 +691,7 @@ end
 -- NORMALISATION DES ADRESSES
 ------------------------------------------------------------
 
-local function normalizeAddress(address)
+normalizeAddress = function(address)
   address = tostring(address or "")
 
   -- Retire espaces, tabulations et retours à la ligne
@@ -647,7 +844,6 @@ local function incomingConnectionScreen()
   local incoming = pendingIncoming
   pendingIncoming = nil
 
-  -- remoteAddress() peut devenir disponible un peu après sgDialIn.
   if not incoming.address or incoming.address == "" then
     local timeout = computer.uptime() + 5
 
@@ -665,11 +861,19 @@ local function incomingConnectionScreen()
   incoming.address = normalizeAddress(incoming.address or "")
   incoming.name =
     incoming.name or findDestinationByAddress(incoming.address)
+  incoming.returnMission =
+    findMissionByAddress(incoming.address)
 
   while true do
     header()
     print("********************************")
-    print("    ALERTE PORTE ENTRANTE")
+
+    if incoming.returnMission then
+      print("      RETOUR D'EQUIPE SG")
+    else
+      print("    ALERTE PORTE ENTRANTE")
+    end
+
     print("********************************")
     print()
 
@@ -690,6 +894,17 @@ local function incomingConnectionScreen()
     print("IRIS    : " .. safeToString(getIrisState()))
     print()
 
+    if incoming.returnMission then
+      local mission = incoming.returnMission
+      local elapsed =
+        currentTimestamp() - (mission.startedAt or 0)
+
+      print("EQUIPE  : " .. mission.team)
+      print("MISSION : " .. mission.missionType)
+      print("DUREE   : " .. formatDuration(elapsed))
+      print()
+    end
+
     if incoming.irisError then
       print("ATTENTION : fermeture automatique")
       print("de l'iris non confirmee.")
@@ -707,10 +922,20 @@ local function incomingConnectionScreen()
     end
 
     separator()
-    print("1 - Ouvrir l'iris")
-    print("2 - Maintenir l'iris ferme")
-    print("3 - Fermer la connexion")
-    print("4 - Actualiser")
+
+    if incoming.returnMission then
+      print("1 - Confirmer le retour et ouvrir l'iris")
+      print("2 - Maintenir l'iris ferme")
+      print("3 - Signaler une anomalie")
+      print("4 - Actualiser")
+      print("5 - Fermer la connexion")
+    else
+      print("1 - Ouvrir l'iris")
+      print("2 - Maintenir l'iris ferme")
+      print("3 - Fermer la connexion")
+      print("4 - Actualiser")
+    end
+
     separator()
     print()
     io.write("Decision SGC > ")
@@ -728,6 +953,35 @@ local function incomingConnectionScreen()
       else
         waitForIrisState("Open", 10)
         emergencyAlarmStop()
+
+        if incoming.returnMission then
+          local mission = incoming.returnMission
+          local elapsed =
+            currentTimestamp() - (mission.startedAt or 0)
+
+          setTeamAvailable(mission.team)
+
+          missionLog(
+            "RETOUR CONFIRME | " .. mission.team ..
+            " | " .. string.upper(
+              mission.destination or "INCONNUE"
+            ) ..
+            " | DUREE " .. formatDuration(elapsed)
+          )
+
+          log(
+            "Retour confirme de " .. mission.team ..
+            " depuis " .. safeToString(incoming.address)
+          )
+
+          print()
+          print("MISSION TERMINEE")
+          print("Equipe : " .. mission.team)
+          print("Duree  : " .. formatDuration(elapsed))
+          waitForEnter()
+          return
+        end
+
         log("Iris ouvert pour connexion entrante depuis " ..
           safeToString(incoming.address))
       end
@@ -742,7 +996,23 @@ local function incomingConnectionScreen()
       print("Surveillance de la connexion...")
       pause(1)
 
-    elseif choice == "3" then
+    elseif choice == "3" and incoming.returnMission then
+      closeIrisImmediately()
+      emergencyAlarmStop()
+
+      missionLog(
+        "ANOMALIE RETOUR | " ..
+        incoming.returnMission.team ..
+        " | " .. safeToString(incoming.address)
+      )
+
+      print()
+      print("ANOMALIE ENREGISTREE")
+      print("L'iris reste ferme.")
+      pause(2)
+
+    elseif choice == "3"
+       or (choice == "5" and incoming.returnMission) then
       local ok, result, reason = pcall(gate.disconnect)
 
       emergencyAlarmStop()
@@ -758,10 +1028,12 @@ local function incomingConnectionScreen()
         print()
         print("Commande de fermeture envoyee.")
         pause(1)
+        return
       end
 
     elseif choice == "4" then
-      -- Le prochain passage de boucle réaffiche les données.
+      -- Réaffichage des informations.
+
     else
       print()
       print("Commande inconnue.")
@@ -906,9 +1178,20 @@ local function buildMission()
     return nil
   end
 
+  local teams = availableTeams()
+
+  if #teams == 0 then
+    header()
+    print("AUCUNE EQUIPE DISPONIBLE")
+    print()
+    print("Toutes les equipes SG sont deja en mission.")
+    waitForEnter()
+    return nil
+  end
+
   local team = selectFromList(
     "SELECTION DE L'EQUIPE",
-    SG_TEAMS
+    teams
   )
 
   if not team then
@@ -1288,6 +1571,8 @@ local function openGate(rawAddress, mission)
     log("Connexion etablie vers " .. address)
 
     if mission then
+      setTeamOnMission(mission)
+
       missionLog(
         "VORTEX STABILISE | " .. mission.team ..
         " | " .. string.upper(mission.destination) ..
@@ -1435,6 +1720,100 @@ local function showLogs()
   waitForEnter()
 end
 
+local function showOperationsCenter()
+  header()
+  print("CENTRE DES OPERATIONS")
+  separator()
+
+  local activeCount = 0
+
+  for _, team in ipairs(SG_TEAMS) do
+    local record =
+      teamState[team] or defaultTeamRecord(team)
+
+    print(team .. " : " .. record.status)
+
+    if record.status == "EN MISSION" then
+      activeCount = activeCount + 1
+
+      local elapsed =
+        currentTimestamp() - (record.startedAt or 0)
+
+      print("  Destination : " ..
+        string.upper(record.destination or "INCONNUE"))
+      print("  Mission     : " ..
+        safeToString(record.missionType))
+      print("  Duree       : " ..
+        formatDuration(elapsed))
+    end
+
+    print()
+  end
+
+  separator()
+  print("Equipes en mission : " .. tostring(activeCount))
+  waitForEnter()
+end
+
+local function teamAdministration()
+  while true do
+    header()
+    print("ADMINISTRATION DES EQUIPES")
+    separator()
+
+    for index, team in ipairs(SG_TEAMS) do
+      local record = teamState[team]
+
+      print(
+        tostring(index) .. " - " .. team ..
+        " [" .. safeToString(record.status) .. "]"
+      )
+    end
+
+    print()
+    print("0 - Retour")
+    print()
+    io.write("Equipe a remettre disponible > ")
+
+    local choice = io.read()
+
+    if choice == "0" then
+      return
+    end
+
+    local index = tonumber(choice)
+    local team = index and SG_TEAMS[index]
+
+    if team then
+      local record = teamState[team]
+
+      header()
+      print("CONFIRMATION")
+      separator()
+      print("Equipe : " .. team)
+      print("Etat   : " .. safeToString(record.status))
+      print()
+      print("1 - Remettre DISPONIBLE")
+      print("2 - Annuler")
+      print()
+      io.write("Decision > ")
+
+      if io.read() == "1" then
+        setTeamAvailable(team)
+        missionLog(
+          "REINITIALISATION MANUELLE | " .. team
+        )
+        print()
+        print(team .. " est maintenant DISPONIBLE.")
+        pause(1)
+      end
+    else
+      print("Selection inconnue.")
+      pause(1)
+    end
+  end
+end
+
 local function showMissionLogs()
   header()
   print("JOURNAL DES MISSIONS")
@@ -1510,6 +1889,7 @@ end
 
 local function main()
   initializeLog()
+  loadTeams()
 
   findGate()
   findAlarm()
@@ -1574,18 +1954,20 @@ local function main()
 
     print()
     separator()
-    print("1 - Autoriser une mission SG")
-    print("2 - Composition manuelle")
-    print("3 - Fermer la porte")
-    print("4 - Controler l'iris")
-    print("5 - Base de donnees planetaires")
-    print("6 - Carnet d'adresses")
-    print("7 - Journal des missions")
-    print("8 - Journal technique")
-    print("9 - Diagnostic complet")
-    print("10 - Methodes SGCraft")
-    print("11 - Arret d'urgence de l'alarme")
-    print("12 - Quitter")
+    print("1 - Centre des operations")
+    print("2 - Autoriser une mission SG")
+    print("3 - Composition manuelle")
+    print("4 - Fermer la porte")
+    print("5 - Controler l'iris")
+    print("6 - Base de donnees planetaires")
+    print("7 - Carnet d'adresses")
+    print("8 - Administration des equipes")
+    print("9 - Journal des missions")
+    print("10 - Journal technique")
+    print("11 - Diagnostic complet")
+    print("12 - Methodes SGCraft")
+    print("13 - Arret d'urgence de l'alarme")
+    print("14 - Quitter")
     separator()
     print()
 
@@ -1596,13 +1978,16 @@ local function main()
       incomingConnectionScreen()
 
     elseif choice == "1" then
+      showOperationsCenter()
+
+    elseif choice == "2" then
       local mission = buildMission()
 
       if mission then
         openGate(mission.destination, mission)
       end
 
-    elseif choice == "2" then
+    elseif choice == "3" then
       header()
       print("COMPOSITION MANUELLE")
       separator()
@@ -1614,31 +1999,34 @@ local function main()
       local destination = io.read()
       openGate(destination)
 
-    elseif choice == "3" then
+    elseif choice == "4" then
       closeGate()
 
-    elseif choice == "4" then
+    elseif choice == "5" then
       irisMenu()
 
-    elseif choice == "5" then
+    elseif choice == "6" then
       destinationDatabase()
 
-    elseif choice == "6" then
+    elseif choice == "7" then
       showAddressBook()
 
-    elseif choice == "7" then
-      showMissionLogs()
-
     elseif choice == "8" then
-      showLogs()
+      teamAdministration()
 
     elseif choice == "9" then
-      showStatus()
+      showMissionLogs()
 
     elseif choice == "10" then
-      showMethods()
+      showLogs()
 
     elseif choice == "11" then
+      showStatus()
+
+    elseif choice == "12" then
+      showMethods()
+
+    elseif choice == "13" then
       header()
       emergencyAlarmStop()
 
@@ -1650,13 +2038,15 @@ local function main()
       log("Arret d'urgence de l'alarme")
       waitForEnter()
 
-    elseif choice == "12" then
+    elseif choice == "14" then
+      saveTeams()
       removeIncomingListener()
       emergencyAlarmStop()
       log("Arret normal du systeme SGC")
 
       header()
       print("Arret du systeme SGC.")
+      print("Donnees des equipes sauvegardees.")
       print("Alarme securisee.")
       return
 
