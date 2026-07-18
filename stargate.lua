@@ -28,10 +28,10 @@ local ALARM_DURATION = 0
 -- Remplace les exemples par les vraies adresses de tes portes.
 -- Les noms sont saisis sans distinction entre majuscules/minuscules.
 local ADDRESS_BOOK = {
-  -- Terre = "zfvsmy6dj",
-  -- Abydos = "bfvga4iw7",
-  -- Chulak = "fffkzpu77",
-  -- P4X354 = "645yitqkc"
+  Terre = "ZFVS-MY6-DJ",
+  Abydos = "BFVG-A4I-W7",
+  Chulak = "FFFK-ZPU-77",
+  P4X354 = "645Y-ITQ-KC"
 }
 
 ------------------------------------------------------------
