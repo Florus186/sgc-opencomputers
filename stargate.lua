@@ -59,7 +59,7 @@ local IDC_CODES = {
 local ADDRESS_BOOK = {
   Terre = "ZFVS-MY6-DJ",
   Abydos = "BFVG-A4I-W7",
-  Chulak = "3FF2-BPI-ER",
+  Chulak = "FFFK-ZPU-77",
   P4X354 = "645Y-ITQ-KC"
 }
 
@@ -127,8 +127,9 @@ local incomingListenerInstalled = false
 -- Etat persistant des equipes SG.
 local teamState = {}
 
--- Déclaration anticipée, définie plus bas.
+-- Déclarations anticipées, définies plus bas.
 local normalizeAddress
+local waitForIrisState
 
 -- Communication IDC : Linked Card ("tunnel") ou carte réseau ("modem").
 local idcTransport = nil
@@ -1082,7 +1083,7 @@ local function removeIncomingListener()
   end
 end
 
-local function waitForIrisState(expected, timeoutSeconds)
+waitForIrisState = function(expected, timeoutSeconds)
   local timeout = computer.uptime() + (timeoutSeconds or 10)
 
   while computer.uptime() < timeout do
