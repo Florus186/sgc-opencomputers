@@ -24,6 +24,16 @@ local DIAL_TIMEOUT = 60
 -- jusqu'à la connexion ou l'échec.
 local ALARM_DURATION = 0
 
+-- Carnet d'adresses.
+-- Remplace les exemples par les vraies adresses de tes portes.
+-- Les noms sont saisis sans distinction entre majuscules/minuscules.
+local ADDRESS_BOOK = {
+  -- Terre = "zfvsmy6dj",
+  -- Abydos = "bfvga4iw7",
+  -- Chulak = "fffkzpu77",
+  -- P4X354 = "645yitqkc"
+}
+
 ------------------------------------------------------------
 -- VARIABLES GLOBALES
 ------------------------------------------------------------
@@ -254,6 +264,114 @@ local function getLocalAddress()
   return address
 end
 
+local function getIrisState()
+  if not gate or not gate.irisState then
+    return "INDISPONIBLE"
+  end
+
+  local ok, state, reason = pcall(gate.irisState)
+
+  if not ok then
+    return "ERREUR"
+  end
+
+  if state == nil then
+    return "ERREUR: " .. safeToString(reason)
+  end
+
+  return state
+end
+
+local function setIris(open)
+  header()
+
+  if not gate then
+    print("ERREUR : PORTE NON DETECTEE")
+    waitForEnter()
+    return false
+  end
+
+  local method = open and gate.openIris or gate.closeIris
+  local action = open and "OUVERTURE" or "FERMETURE"
+
+  if not method then
+    print("ERREUR API")
+    print("La commande d'iris est indisponible.")
+    waitForEnter()
+    return false
+  end
+
+  print(action .. " DE L'IRIS")
+  separator()
+  print("Etat initial : " .. safeToString(getIrisState()))
+  print()
+
+  local ok, result, reason = pcall(method)
+
+  if not ok then
+    print("ECHEC : " .. safeToString(result))
+    log("Erreur iris : " .. safeToString(result))
+    waitForEnter()
+    return false
+  end
+
+  if result == nil then
+    print("ECHEC : " .. safeToString(reason))
+    log("Erreur iris : " .. safeToString(reason))
+    waitForEnter()
+    return false
+  end
+
+  local timeout = computer.uptime() + 10
+  local wanted = open and "Open" or "Closed"
+
+  while computer.uptime() < timeout do
+    local state = getIrisState()
+
+    if state == wanted then
+      print("Iris " .. (open and "ouvert." or "ferme."))
+      log("Iris " .. (open and "ouvert" or "ferme"))
+      waitForEnter()
+      return true
+    end
+
+    os.sleep(0.25)
+  end
+
+  print("Commande envoyee.")
+  print("Etat actuel : " .. safeToString(getIrisState()))
+  waitForEnter()
+  return true
+end
+
+local function irisMenu()
+  while true do
+    header()
+    print("CONTROLE DE L'IRIS")
+    separator()
+    print("Etat : " .. safeToString(getIrisState()))
+    print()
+    print("1 - Ouvrir l'iris")
+    print("2 - Fermer l'iris")
+    print("3 - Retour")
+    print()
+    io.write("Commande IRIS > ")
+
+    local choice = io.read()
+
+    if choice == "1" then
+      setIris(true)
+    elseif choice == "2" then
+      setIris(false)
+    elseif choice == "3" then
+      return
+    else
+      print("Commande inconnue.")
+      pause(1)
+    end
+  end
+end
+
 local function getDialCost(address)
   if not gate or not gate.energyToDial then
     return nil, "Methode energyToDial indisponible"
@@ -284,6 +402,52 @@ local function normalizeAddress(address)
   address = address:upper()
 
   return address
+end
+
+local function normalizeName(name)
+  name = tostring(name or ""):lower()
+  name = name:gsub("^%s+", "")
+  name = name:gsub("%s+$", "")
+  return name
+end
+
+local function resolveDestination(input)
+  local name = normalizeName(input)
+  local savedAddress = ADDRESS_BOOK[name]
+
+  if savedAddress then
+    return normalizeAddress(savedAddress), name
+  end
+
+  return normalizeAddress(input), nil
+end
+
+local function showAddressBook()
+  header()
+  print("CARNET D'ADRESSES")
+  separator()
+
+  local names = {}
+
+  for name in pairs(ADDRESS_BOOK) do
+    table.insert(names, name)
+  end
+
+  table.sort(names)
+
+  if #names == 0 then
+    print("Le carnet est vide.")
+    print()
+    print("Ajoute tes destinations dans ADDRESS_BOOK")
+    print("au debut du fichier stargate.lua.")
+  else
+    for _, name in ipairs(names) do
+      print(string.upper(name) .. " : " ..
+        safeToString(ADDRESS_BOOK[name]))
+    end
+  end
+
+  waitForEnter()
 end
 
 local function validateAddress(address)
@@ -318,6 +482,7 @@ local function showStatus()
   print("Chevrons      : " .. safeToString(chevrons))
   print("Direction     : " .. safeToString(direction))
   print("Adresse locale: " .. safeToString(localAddress))
+  print("Iris          : " .. safeToString(getIrisState()))
 
   if energy then
     print("Energie       : " .. tostring(energy) .. " SU")
@@ -348,7 +513,7 @@ end
 local function openGate(rawAddress)
   header()
 
-  local address = normalizeAddress(rawAddress)
+  local address, destinationName = resolveDestination(rawAddress)
   local valid, validationError = validateAddress(address)
 
   if not valid then
@@ -395,7 +560,12 @@ local function openGate(rawAddress)
     return false
   end
 
-  print("DESTINATION : " .. address)
+  if destinationName then
+    print("DESTINATION : " .. string.upper(destinationName))
+    print("ADRESSE     : " .. address)
+  else
+    print("DESTINATION : " .. address)
+  end
   separator()
   print("Verification de l'adresse...")
 
@@ -479,7 +649,7 @@ local function openGate(rawAddress)
   local startTime = computer.uptime()
   local alarmStopTime = startTime + ALARM_DURATION
   local timeoutTime = startTime + DIAL_TIMEOUT
-    local previousState = nil
+  local previousState = nil
   local previousChevrons = -1
   local connected = false
 
@@ -768,6 +938,7 @@ local function main()
     print("CHEVRONS : " .. safeToString(chevrons))
     print("DIRECTION: " .. safeToString(direction))
     print("ADRESSE  : " .. safeToString(localAddress))
+    print("IRIS     : " .. safeToString(getIrisState()))
 
     if energy then
       print("ENERGIE  : " .. tostring(energy) .. " SU")
@@ -784,13 +955,15 @@ local function main()
 
     print()
     separator()
-    print("1 - Composer une adresse")
+    print("1 - Composer une destination")
     print("2 - Fermer la porte")
-    print("3 - Diagnostic complet")
-    print("4 - Consulter le journal")
-    print("5 - Afficher les methodes SGCraft")
-    print("6 - Arret d'urgence de l'alarme")
-    print("7 - Quitter")
+    print("3 - Controler l'iris")
+    print("4 - Carnet d'adresses")
+    print("5 - Diagnostic complet")
+    print("6 - Consulter le journal")
+    print("7 - Afficher les methodes SGCraft")
+    print("8 - Arret d'urgence de l'alarme")
+    print("9 - Quitter")
     separator()
     print()
 
@@ -802,27 +975,33 @@ local function main()
       print("COMPOSITION D'UNE DESTINATION")
       separator()
       print()
-      print("Entre une adresse de 7 ou 9 caracteres.")
-      print("Les tirets et espaces sont acceptes.")
+      print("Entre un nom du carnet ou une adresse.")
+      print("Exemples : abydos, chulak, ABC-DEFG")
       print()
-      io.write("Adresse > ")
+      io.write("Destination > ")
 
-      local address = io.read()
-      openGate(address)
+      local destination = io.read()
+      openGate(destination)
 
     elseif choice == "2" then
       closeGate()
 
     elseif choice == "3" then
-      showStatus()
+      irisMenu()
 
     elseif choice == "4" then
-      showLogs()
+      showAddressBook()
 
     elseif choice == "5" then
-      showMethods()
+      showStatus()
 
     elseif choice == "6" then
+      showLogs()
+
+    elseif choice == "7" then
+      showMethods()
+
+    elseif choice == "8" then
       header()
       emergencyAlarmStop()
 
@@ -834,7 +1013,7 @@ local function main()
       log("Arret d'urgence de l'alarme")
       waitForEnter()
 
-    elseif choice == "7" then
+    elseif choice == "9" then
       emergencyAlarmStop()
       log("Arret normal du systeme SGC")
 
