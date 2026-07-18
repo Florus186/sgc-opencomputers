@@ -6,6 +6,7 @@
 
 local component = require("component")
 local computer = require("computer")
+local event = require("event")
 local term = require("term")
 local filesystem = require("filesystem")
 
@@ -23,6 +24,13 @@ local DIAL_TIMEOUT = 60
 -- de la composition. Mettre 0 pour la laisser sonner
 -- jusqu'à la connexion ou l'échec.
 local ALARM_DURATION = 0
+
+-- Sécurité des connexions entrantes.
+-- L'iris se ferme dès que SGCraft signale un appel entrant.
+local AUTO_CLOSE_IRIS_ON_INCOMING = true
+
+-- L'alarme entrante reste active jusqu'à l'affichage de l'alerte.
+local INCOMING_ALARM = true
 
 -- Carnet d'adresses.
 -- Remplace les exemples par les vraies adresses de tes portes.
@@ -45,6 +53,10 @@ local alarm = nil
 local alarmAddress = nil
 
 local alarmActive = false
+
+-- Dernière connexion entrante signalée par SGCraft.
+local pendingIncoming = nil
+local incomingListenerInstalled = false
 
 ------------------------------------------------------------
 -- OUTILS
@@ -264,6 +276,21 @@ local function getLocalAddress()
   return address
 end
 
+local function getRemoteAddress()
+  if not gate or not gate.remoteAddress then
+    return nil
+  end
+
+  local ok, address = pcall(gate.remoteAddress)
+
+  if not ok or not address or address == "" then
+    return nil
+  end
+
+  return normalizeAddress and normalizeAddress(address)
+      or tostring(address)
+end
+
 local function getIrisState()
   if not gate or not gate.irisState then
     return "INDISPONIBLE"
@@ -359,7 +386,9 @@ local function irisMenu()
 
     local choice = io.read()
 
-    if choice == "1" then
+    if pendingIncoming then
+      incomingConnectionScreen()
+    elseif choice == "1" then
       setIris(true)
     elseif choice == "2" then
       setIris(false)
@@ -424,6 +453,248 @@ local function resolveDestination(input)
   return normalizeAddress(input), nil
 end
 
+local function findDestinationByAddress(rawAddress)
+  local searched = normalizeAddress(rawAddress)
+
+  if searched == "" then
+    return nil
+  end
+
+  for savedName, savedAddress in pairs(ADDRESS_BOOK) do
+    if normalizeAddress(savedAddress) == searched then
+      return tostring(savedName)
+    end
+  end
+
+  return nil
+end
+
+local function closeIrisImmediately()
+  if not gate or not gate.closeIris then
+    return false, "Commande closeIris indisponible"
+  end
+
+  local ok, result, reason = pcall(gate.closeIris)
+
+  if not ok then
+    return false, result
+  end
+
+  if result == nil then
+    return false, reason
+  end
+
+  return true
+end
+
+local function incomingEventHandler(_, source, remoteAddress)
+  if source ~= gateAddress then
+    return
+  end
+
+  local address = normalizeAddress(remoteAddress or "")
+  local knownName = findDestinationByAddress(address)
+
+  pendingIncoming = {
+    address = address,
+    name = knownName,
+    detectedAt = computer.uptime(),
+    irisCommandSent = false,
+    irisError = nil
+  }
+
+  if AUTO_CLOSE_IRIS_ON_INCOMING then
+    local ok, reason = closeIrisImmediately()
+    pendingIncoming.irisCommandSent = ok
+    pendingIncoming.irisError = reason
+  end
+
+  if INCOMING_ALARM then
+    siren(true)
+  end
+
+  computer.beep(900, 0.15)
+  computer.beep(700, 0.15)
+  computer.beep(900, 0.15)
+
+  log(
+    "Connexion entrante depuis " ..
+    (knownName and string.upper(knownName) or "ORIGINE INCONNUE") ..
+    " [" .. safeToString(address) .. "]"
+  )
+end
+
+local function installIncomingListener()
+  if incomingListenerInstalled then
+    return true
+  end
+
+  local ok, reason =
+    event.listen("sgDialIn", incomingEventHandler)
+
+  if ok then
+    incomingListenerInstalled = true
+    return true
+  end
+
+  log("Impossible d'installer l'ecoute sgDialIn : " ..
+    safeToString(reason))
+
+  return false, reason
+end
+
+local function removeIncomingListener()
+  if incomingListenerInstalled then
+    pcall(event.ignore, "sgDialIn", incomingEventHandler)
+    incomingListenerInstalled = false
+  end
+end
+
+local function waitForIrisState(expected, timeoutSeconds)
+  local timeout = computer.uptime() + (timeoutSeconds or 10)
+
+  while computer.uptime() < timeout do
+    if getIrisState() == expected then
+      return true
+    end
+
+    os.sleep(0.20)
+  end
+
+  return false
+end
+
+local function incomingConnectionScreen()
+  if not pendingIncoming then
+    return
+  end
+
+  local incoming = pendingIncoming
+  pendingIncoming = nil
+
+  -- remoteAddress() peut devenir disponible un peu après sgDialIn.
+  if not incoming.address or incoming.address == "" then
+    local timeout = computer.uptime() + 5
+
+    while computer.uptime() < timeout do
+      incoming.address = getRemoteAddress()
+
+      if incoming.address and incoming.address ~= "" then
+        break
+      end
+
+      os.sleep(0.20)
+    end
+  end
+
+  incoming.address = normalizeAddress(incoming.address or "")
+  incoming.name =
+    incoming.name or findDestinationByAddress(incoming.address)
+
+  while true do
+    header()
+    print("********************************")
+    print("    ALERTE PORTE ENTRANTE")
+    print("********************************")
+    print()
+
+    if incoming.name then
+      print("ORIGINE : " .. string.upper(incoming.name))
+    else
+      print("ORIGINE : INCONNUE")
+    end
+
+    print("ADRESSE : " ..
+      (incoming.address ~= "" and incoming.address or "NON RECUE"))
+
+    local state, chevrons, direction = getGateState()
+
+    print("ETAT    : " .. safeToString(state))
+    print("CHEVRONS: " .. safeToString(chevrons))
+    print("SENS    : " .. safeToString(direction))
+    print("IRIS    : " .. safeToString(getIrisState()))
+    print()
+
+    if incoming.irisError then
+      print("ATTENTION : fermeture automatique")
+      print("de l'iris non confirmee.")
+      print("Detail : " .. safeToString(incoming.irisError))
+      print()
+    end
+
+    if state == "Idle" or state == "Offline" then
+      emergencyAlarmStop()
+      print("La connexion entrante est terminee.")
+      log("Fin de connexion entrante [" ..
+        safeToString(incoming.address) .. "]")
+      waitForEnter()
+      return
+    end
+
+    separator()
+    print("1 - Ouvrir l'iris")
+    print("2 - Maintenir l'iris ferme")
+    print("3 - Fermer la connexion")
+    print("4 - Actualiser")
+    separator()
+    print()
+    io.write("Decision SGC > ")
+
+    local choice = io.read()
+
+    if choice == "1" then
+      local ok, result, reason = pcall(gate.openIris)
+
+      if not ok or result == nil then
+        print()
+        print("ECHEC D'OUVERTURE : " ..
+          safeToString(ok and reason or result))
+        pause(2)
+      else
+        waitForIrisState("Open", 10)
+        emergencyAlarmStop()
+        log("Iris ouvert pour connexion entrante depuis " ..
+          safeToString(incoming.address))
+      end
+
+    elseif choice == "2" then
+      closeIrisImmediately()
+      emergencyAlarmStop()
+      log("Iris maintenu ferme pour connexion entrante depuis " ..
+        safeToString(incoming.address))
+      print()
+      print("IRIS MAINTENU FERME")
+      print("Surveillance de la connexion...")
+      pause(1)
+
+    elseif choice == "3" then
+      local ok, result, reason = pcall(gate.disconnect)
+
+      emergencyAlarmStop()
+
+      if not ok or result == nil then
+        print()
+        print("ECHEC DE DECONNEXION : " ..
+          safeToString(ok and reason or result))
+        pause(2)
+      else
+        log("Connexion entrante fermee manuellement depuis " ..
+          safeToString(incoming.address))
+        print()
+        print("Commande de fermeture envoyee.")
+        pause(1)
+      end
+
+    elseif choice == "4" then
+      -- Le prochain passage de boucle réaffiche les données.
+    else
+      print()
+      print("Commande inconnue.")
+      pause(1)
+    end
+  end
+end
+
 local function showAddressBook()
   header()
   print("CARNET D'ADRESSES")
@@ -476,6 +747,7 @@ local function showStatus()
   local state, chevrons, direction = getGateState()
   local energy, energyError = getEnergy()
   local localAddress = getLocalAddress()
+  local remoteAddress = getRemoteAddress()
 
   print("DIAGNOSTIC DE LA PORTE")
   separator()
@@ -484,6 +756,7 @@ local function showStatus()
   print("Chevrons      : " .. safeToString(chevrons))
   print("Direction     : " .. safeToString(direction))
   print("Adresse locale: " .. safeToString(localAddress))
+  print("Adresse dist. : " .. safeToString(remoteAddress))
   print("Iris          : " .. safeToString(getIrisState()))
 
   if energy then
@@ -907,6 +1180,10 @@ local function main()
   findGate()
   findAlarm()
 
+  if gate then
+    installIncomingListener()
+  end
+
   -- Au démarrage, on arrête une éventuelle alarme
   -- restée active après un ancien plantage.
   emergencyAlarmStop()
@@ -930,16 +1207,22 @@ local function main()
   end
 
   while true do
+    if pendingIncoming then
+      incomingConnectionScreen()
+    end
+
     header()
 
     local state, chevrons, direction = getGateState()
     local energy = getEnergy()
     local localAddress = getLocalAddress()
+    local remoteAddress = getRemoteAddress()
 
     print("PORTE    : " .. safeToString(state))
     print("CHEVRONS : " .. safeToString(chevrons))
     print("DIRECTION: " .. safeToString(direction))
     print("ADRESSE  : " .. safeToString(localAddress))
+    print("DISTANTE : " .. safeToString(remoteAddress))
     print("IRIS     : " .. safeToString(getIrisState()))
 
     if energy then
@@ -1016,6 +1299,7 @@ local function main()
       waitForEnter()
 
     elseif choice == "9" then
+      removeIncomingListener()
       emergencyAlarmStop()
       log("Arret normal du systeme SGC")
 
@@ -1037,6 +1321,7 @@ end
 ------------------------------------------------------------
 
 local function emergencyCleanup(errorMessage)
+  removeIncomingListener()
   emergencyAlarmStop()
 
   print()
