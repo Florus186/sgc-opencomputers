@@ -1280,6 +1280,158 @@ waitForIrisState = function(expected, timeoutSeconds)
   return false
 end
 
+local RETURN_PROTOCOLS = {
+  NORMAL = {
+    label = "RETOUR NORMAL",
+    alert = nil,
+    open = true
+  },
+  MEDICAL = {
+    label = "URGENCE MEDICALE",
+    alert = "JAUNE",
+    open = true
+  },
+  QUARANTAINE = {
+    label = "RISQUE BIOLOGIQUE / QUARANTAINE",
+    alert = "ROUGE",
+    open = true
+  },
+  DETRESSE = {
+    label = "EQUIPE EN DETRESSE",
+    alert = "ROUGE",
+    open = true
+  },
+  CONTRAINTE = {
+    label = "EQUIPE SOUS LA CONTRAINTE",
+    alert = "NOIR",
+    open = false
+  }
+}
+
+local function selectReturnProtocol(team)
+  header()
+  print("PROTOCOLE DE RETOUR")
+  separator()
+  print("Equipe : " .. safeToString(team))
+  print()
+  print("1 - Retour normal")
+  print("2 - Urgence medicale")
+  print("3 - Quarantaine")
+  print("4 - Detresse")
+  print("5 - Sous la contrainte")
+  print("0 - Annuler")
+  separator()
+  print()
+  io.write("Protocole > ")
+
+  local choice = io.read()
+  local key = ({
+    ["1"] = "NORMAL",
+    ["2"] = "MEDICAL",
+    ["3"] = "QUARANTAINE",
+    ["4"] = "DETRESSE",
+    ["5"] = "CONTRAINTE"
+  })[choice]
+
+  if choice == "0" then
+    return nil
+  end
+
+  if not key then
+    return nil, "Protocole inconnu"
+  end
+
+  return key, RETURN_PROTOCOLS[key]
+end
+
+local function authorizeReturnProtocol(team, mission, protocolKey)
+  local protocol = RETURN_PROTOCOLS[protocolKey]
+
+  if not protocol then
+    return false, "Protocole inconnu"
+  end
+
+  missionLog(
+    "PROTOCOLE RETOUR | " .. team ..
+    " | " .. protocolKey ..
+    " | " .. safeToString(mission.destination)
+  )
+
+  if protocol.alert then
+    registerSecurityIncident(
+      protocol.label .. " pour " .. team,
+      protocol.alert
+    )
+  end
+
+  if protocolKey == "CONTRAINTE" then
+    closeIrisImmediately()
+    siren(true)
+
+    missionLog(
+      "RETOUR REFUSE | " .. team ..
+      " | CODE CONTRAINTE"
+    )
+
+    return false,
+      "CODE DE CONTRAINTE : iris verrouillee, DEFCON NOIR"
+  end
+
+  if protocolKey == "QUARANTAINE" then
+    header()
+    print("PROTOCOLE QUARANTAINE")
+    separator()
+    print("Equipe : " .. team)
+    print()
+    print("L'ouverture de l'iris place la base")
+    print("en confinement biologique.")
+    print()
+    print("Tape OUVRIR pour confirmer.")
+    io.write("> ")
+
+    if io.read() ~= "OUVRIR" then
+      closeIrisImmediately()
+      missionLog(
+        "QUARANTAINE ANNULEE | " .. team
+      )
+      return false, "Ouverture annulee par l'operateur"
+    end
+  elseif protocolKey == "DETRESSE" then
+    header()
+    print("PROTOCOLE DETRESSE")
+    separator()
+    print("Equipe : " .. team)
+    print()
+    print("Ouverture d'urgence demandee.")
+    print("Tape SECOURS pour confirmer.")
+    io.write("> ")
+
+    if io.read() ~= "SECOURS" then
+      closeIrisImmediately()
+      missionLog(
+        "SECOURS NON AUTORISE | " .. team
+      )
+      return false, "Autorisation de secours refusee"
+    end
+  elseif protocolKey == "MEDICAL" then
+    header()
+    print("URGENCE MEDICALE")
+    separator()
+    print("Equipe : " .. team)
+    print()
+    print("Prepare l'equipe medicale.")
+    print("Tape MEDICAL pour ouvrir l'iris.")
+    io.write("> ")
+
+    if io.read() ~= "MEDICAL" then
+      closeIrisImmediately()
+      return false, "Ouverture medicale annulee"
+    end
+  end
+
+  return openIrisForValidatedIDC(team, mission)
+end
+
 local function incomingConnectionScreen()
   if not pendingIncoming then
     return
@@ -1455,20 +1607,34 @@ local function incomingConnectionScreen()
         pause(2)
 
       else
-        local opened, reason =
-          openIrisForValidatedIDC(
-            incoming.returnMission.team,
-            incoming.returnMission
+        local protocolKey, protocolOrError =
+          selectReturnProtocol(
+            incoming.returnMission.team
           )
 
-        if opened then
-          completeReturn(incoming.returnMission)
-          return
-        end
+        if not protocolKey then
+          print()
+          print("PROTOCOLE ANNULE")
+          print(safeToString(protocolOrError or ""))
+          pause(1)
+        else
+          local opened, reason =
+            authorizeReturnProtocol(
+              incoming.returnMission.team,
+              incoming.returnMission,
+              protocolKey
+            )
 
-        print()
-        print("ECHEC D'OUVERTURE : " .. safeToString(reason))
-        pause(2)
+          if opened then
+            completeReturn(incoming.returnMission)
+            return
+          end
+
+          print()
+          print("IRIS NON OUVERTE")
+          print(safeToString(reason))
+          pause(2)
+        end
       end
 
     elseif incoming.returnMission and choice == "2" then
@@ -1506,20 +1672,34 @@ local function incomingConnectionScreen()
         pause(2)
 
       else
-        local opened, reason =
-          openIrisForValidatedIDC(
-            incoming.returnMission.team,
-            incoming.returnMission
+        local protocolKey, protocolOrError =
+          selectReturnProtocol(
+            incoming.returnMission.team
           )
 
-        if opened then
-          completeReturn(incoming.returnMission)
-          return
-        end
+        if not protocolKey then
+          print()
+          print("PROTOCOLE ANNULE")
+          print(safeToString(protocolOrError or ""))
+          pause(1)
+        else
+          local opened, reason =
+            authorizeReturnProtocol(
+              incoming.returnMission.team,
+              incoming.returnMission,
+              protocolKey
+            )
 
-        print()
-        print("ECHEC D'OUVERTURE : " .. safeToString(reason))
-        pause(2)
+          if opened then
+            completeReturn(incoming.returnMission)
+            return
+          end
+
+          print()
+          print("IRIS NON OUVERTE")
+          print(safeToString(reason))
+          pause(2)
+        end
       end
 
     elseif incoming.returnMission and choice == "3" then
@@ -1754,6 +1934,22 @@ local function selectFromList(title, values)
 end
 
 local function buildMission()
+  if defconAtLeast("ROUGE") then
+    header()
+    print("AUTORISATION DE MISSION REFUSEE")
+    print()
+    print("Niveau actuel : " .. defconLevel)
+    print("Motif          : " .. defconReason)
+    print()
+    print("Reviens au niveau JAUNE ou VERT")
+    print("avant d'autoriser un depart.")
+    missionLog(
+      "MISSION BLOQUEE | DEFCON " .. defconLevel
+    )
+    waitForEnter()
+    return nil
+  end
+
   local destination = selectFromList(
     "SELECTION DE LA DESTINATION",
     sortedDestinationNames()
@@ -1917,6 +2113,35 @@ end
 
 local function openGate(rawAddress, mission)
   header()
+
+  if defconLevel == "NOIR" then
+    print("COMPOSITION INTERDITE")
+    print()
+    print("La base est en ALERTE NOIRE.")
+    print("Aucune connexion sortante n'est autorisee.")
+    print("Motif : " .. defconReason)
+    missionLog(
+      "COMPOSITION BLOQUEE | DEFCON NOIR | " ..
+      safeToString(rawAddress)
+    )
+    waitForEnter()
+    return false
+  end
+
+  if defconLevel == "ROUGE" then
+    print("COMPOSITION INTERDITE")
+    print()
+    print("La base est en ALERTE ROUGE.")
+    print("Les missions et compositions sortantes")
+    print("sont suspendues.")
+    print("Motif : " .. defconReason)
+    missionLog(
+      "COMPOSITION BLOQUEE | DEFCON ROUGE | " ..
+      safeToString(rawAddress)
+    )
+    waitForEnter()
+    return false
+  end
 
   local address, destinationName = resolveDestination(rawAddress)
   local valid, validationError = validateAddress(address)
@@ -2413,6 +2638,9 @@ local function showDefconControl()
     print("ROUGE : départs et compositions interdits")
     print("NOIR  : verrouillage de la base et de l'iris")
     print()
+    print("Protocoles retour : NORMAL, MEDICAL,")
+    print("QUARANTAINE, DETRESSE, CONTRAINTE")
+    print()
     separator()
     print("1 - Passer au niveau VERT")
     print("2 - Passer au niveau JAUNE")
@@ -2640,7 +2868,7 @@ local function main()
   -- restée active après un ancien plantage.
   emergencyAlarmStop()
 
-  log("Demarrage du systeme SGC")
+  log("Demarrage du systeme SGC - DEFCON + PROTOCOLES")
 
   if not gate then
     header()
