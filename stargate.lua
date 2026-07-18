@@ -21,6 +21,7 @@ local DATA_DIRECTORY = "/home/sgc"
 local TEAM_DATABASE_FILE = DATA_DIRECTORY .. "/teams.db"
 local DEFCON_DATABASE_FILE = DATA_DIRECTORY .. "/defcon.db"
 local DEFCON_LOG_FILE = LOG_DIRECTORY .. "/defcon.log"
+local INTELLIGENCE_DATABASE_FILE = DATA_DIRECTORY .. "/intelligence.db"
 
 -- Durée maximale autorisée pour une composition
 local DIAL_TIMEOUT = 60
@@ -134,6 +135,8 @@ local normalizeAddress
 local waitForIrisState
 local siren
 local closeIrisImmediately
+local recordPlanetVisit
+local recordPlanetReturn
 
 -- Communication IDC : Linked Card ("tunnel") ou carte réseau ("modem").
 local idcTransport = nil
@@ -153,6 +156,21 @@ local defconLevel = "VERT"
 local defconReason = "Situation normale"
 local defconChangedAt = 0
 
+-- Renseignements persistants accumulés au fil des missions.
+local intelligenceData = {}
+
+-- Interface graphique légère.
+local gpu = component.isAvailable("gpu") and component.gpu or nil
+local UI_COLORS = {
+  normal = 0xFFFFFF,
+  muted = 0xAAAAAA,
+  green = 0x55FF55,
+  yellow = 0xFFFF55,
+  red = 0xFF5555,
+  cyan = 0x55FFFF,
+  title = 0x55AAFF
+}
+
 ------------------------------------------------------------
 -- OUTILS
 ------------------------------------------------------------
@@ -165,6 +183,32 @@ local function waitForEnter()
   print()
   io.write("Appuie sur Entree pour continuer...")
   io.read()
+end
+
+local function setTextColor(color)
+  if gpu and gpu.setForeground then
+    pcall(gpu.setForeground, color or UI_COLORS.normal)
+  end
+end
+
+local function resetTextColor()
+  setTextColor(UI_COLORS.normal)
+end
+
+local function printColored(textValue, color)
+  setTextColor(color)
+  print(textValue)
+  resetTextColor()
+end
+
+local function alertColor()
+  if defconLevel == "VERT" then
+    return UI_COLORS.green
+  elseif defconLevel == "JAUNE" then
+    return UI_COLORS.yellow
+  end
+
+  return UI_COLORS.red
 end
 
 local function clear()
@@ -529,6 +573,14 @@ local function setTeamOnMission(mission)
   }
 
   saveTeams()
+
+  if recordPlanetVisit then
+    recordPlanetVisit(
+      mission.destination or "INCONNUE",
+      mission.team
+    )
+  end
+
   return true
 end
 
@@ -573,20 +625,20 @@ end
 local function header()
   clear()
 
-  print("================================")
-  print("          SGC CONTROL")
+  printColored("================================", UI_COLORS.title)
+  printColored("          SGC CONTROL", UI_COLORS.title)
   print("   STARGATE COMMAND SYSTEM")
   print("--------------------------------")
 
   if defconLevel == "ROUGE" then
-    print("      *** ALERTE ROUGE ***")
+    printColored("      *** ALERTE ROUGE ***", UI_COLORS.red)
   elseif defconLevel == "NOIR" then
-    print("      !!! ALERTE NOIRE !!!")
+    printColored("      !!! ALERTE NOIRE !!!", UI_COLORS.red)
   else
-    print("      ALERTE : " .. defconLevel)
+    printColored("      ALERTE : " .. defconLevel, alertColor())
   end
 
-  print("================================")
+  printColored("================================", UI_COLORS.title)
   print()
 end
 
@@ -1466,6 +1518,12 @@ local function incomingConnectionScreen()
 
     setTeamAvailable(mission.team)
 
+    if recordPlanetReturn then
+      recordPlanetReturn(
+        mission.destination or "INCONNUE"
+      )
+    end
+
     missionLog(
       "RETOUR CONFIRME | " .. mission.team ..
       " | " .. string.upper(
@@ -1807,15 +1865,227 @@ local function incomingConnectionScreen()
   end
 end
 
+local function sanitizeIntelField(value)
+  return tostring(value or "")
+    :gsub("\t", " ")
+    :gsub("\r", " ")
+    :gsub("\n", " ")
+end
+
+local function defaultIntelligenceRecord(name)
+  return {
+    name = tostring(name or "INCONNUE"),
+    visits = 0,
+    returns = 0,
+    lastVisit = 0,
+    lastReturn = 0,
+    discoveredBy = "",
+    status = "",
+    threat = "",
+    population = "",
+    contact = "",
+    notes = ""
+  }
+end
+
+local function getIntelligenceRecord(name)
+  local key = normalizeName(name)
+
+  if not intelligenceData[key] then
+    intelligenceData[key] = defaultIntelligenceRecord(name)
+  end
+
+  return intelligenceData[key]
+end
+
+local function saveIntelligence()
+  if not filesystem.exists(DATA_DIRECTORY) then
+    filesystem.makeDirectory(DATA_DIRECTORY)
+  end
+
+  local file = io.open(INTELLIGENCE_DATABASE_FILE, "w")
+
+  if not file then
+    log("Impossible de sauvegarder la base de renseignement")
+    return false
+  end
+
+  for key, record in pairs(intelligenceData) do
+    file:write(table.concat({
+      sanitizeIntelField(key),
+      sanitizeIntelField(record.name),
+      tostring(record.visits or 0),
+      tostring(record.returns or 0),
+      tostring(record.lastVisit or 0),
+      tostring(record.lastReturn or 0),
+      sanitizeIntelField(record.discoveredBy),
+      sanitizeIntelField(record.status),
+      sanitizeIntelField(record.threat),
+      sanitizeIntelField(record.population),
+      sanitizeIntelField(record.contact),
+      sanitizeIntelField(record.notes)
+    }, "\t") .. "\n")
+  end
+
+  file:close()
+  return true
+end
+
+local function loadIntelligence()
+  intelligenceData = {}
+  local file = io.open(INTELLIGENCE_DATABASE_FILE, "r")
+
+  if not file then
+    for name in pairs(ADDRESS_BOOK) do
+      getIntelligenceRecord(name)
+    end
+
+    saveIntelligence()
+    return
+  end
+
+  for line in file:lines() do
+    local fields = {}
+
+    for field in (line .. "\t"):gmatch("(.-)\t") do
+      table.insert(fields, field)
+    end
+
+    local key = fields[1]
+
+    if key and key ~= "" then
+      intelligenceData[key] = {
+        name = fields[2] or key,
+        visits = tonumber(fields[3]) or 0,
+        returns = tonumber(fields[4]) or 0,
+        lastVisit = tonumber(fields[5]) or 0,
+        lastReturn = tonumber(fields[6]) or 0,
+        discoveredBy = fields[7] or "",
+        status = fields[8] or "",
+        threat = fields[9] or "",
+        population = fields[10] or "",
+        contact = fields[11] or "",
+        notes = fields[12] or ""
+      }
+    end
+  end
+
+  file:close()
+
+  for name in pairs(ADDRESS_BOOK) do
+    getIntelligenceRecord(name)
+  end
+end
+
+recordPlanetVisit = function(name, team)
+  local record = getIntelligenceRecord(name)
+  record.visits = (record.visits or 0) + 1
+  record.lastVisit = currentTimestamp()
+
+  if record.discoveredBy == "" and team then
+    record.discoveredBy = tostring(team)
+  end
+
+  saveIntelligence()
+end
+
+recordPlanetReturn = function(name)
+  local record = getIntelligenceRecord(name)
+  record.returns = (record.returns or 0) + 1
+  record.lastReturn = currentTimestamp()
+  saveIntelligence()
+end
+
+local function formatIntelTime(value)
+  value = tonumber(value) or 0
+
+  if value <= 0 then
+    return "JAMAIS"
+  end
+
+  if os.date then
+    return os.date("%Y-%m-%d %H:%M", value)
+  end
+
+  return tostring(value)
+end
+
+local function editIntelligenceRecord(name)
+  local record = getIntelligenceRecord(name)
+
+  while true do
+    header()
+    print("EDITION DU DOSSIER : " .. string.upper(name))
+    separator()
+    print("1 - Statut      : " ..
+      (record.status ~= "" and record.status or "HERITE"))
+    print("2 - Menace      : " ..
+      (record.threat ~= "" and record.threat or "HERITEE"))
+    print("3 - Population  : " ..
+      (record.population ~= "" and record.population or "INCONNUE"))
+    print("4 - Contact     : " ..
+      (record.contact ~= "" and record.contact or "INCONNU"))
+    print("5 - Notes       : " ..
+      (record.notes ~= "" and record.notes or "AUCUNE"))
+    print("0 - Retour")
+    print()
+    io.write("Champ > ")
+
+    local choice = io.read()
+
+    if choice == "0" then
+      saveIntelligence()
+      return
+    end
+
+    local field = ({
+      ["1"] = "status",
+      ["2"] = "threat",
+      ["3"] = "population",
+      ["4"] = "contact",
+      ["5"] = "notes"
+    })[choice]
+
+    if field then
+      print()
+      io.write("Nouvelle valeur > ")
+      record[field] = io.read() or ""
+      saveIntelligence()
+      missionLog(
+        "RENSEIGNEMENT MODIFIE | " ..
+        string.upper(name) .. " | " .. field
+      )
+    else
+      print("Selection inconnue.")
+      pause(1)
+    end
+  end
+end
+
+
 local function getDestinationInfo(name)
   local key = normalizeName(name)
   local data = DESTINATION_DATA[key] or {}
+  local intel = getIntelligenceRecord(name)
 
   return {
     galaxy = data.galaxy or "INCONNUE",
-    status = data.status or "NON DETERMINE",
-    threat = data.threat or "INCONNU",
-    notes = data.notes or "Aucune note disponible."
+    status = intel.status ~= "" and intel.status
+      or data.status or "NON DETERMINE",
+    threat = intel.threat ~= "" and intel.threat
+      or data.threat or "INCONNU",
+    notes = intel.notes ~= "" and intel.notes
+      or data.notes or "Aucune note disponible.",
+    population = intel.population ~= "" and intel.population
+      or "INCONNUE",
+    contact = intel.contact ~= "" and intel.contact
+      or "INCONNU",
+    visits = intel.visits or 0,
+    returns = intel.returns or 0,
+    lastVisit = intel.lastVisit or 0,
+    lastReturn = intel.lastReturn or 0,
+    discoveredBy = intel.discoveredBy ~= "" and intel.discoveredBy
+      or "NON RENSEIGNE"
   }
 end
 
@@ -1843,21 +2113,49 @@ local function showDestinationFile(name)
     return
   end
 
-  local info = getDestinationInfo(resolvedName)
+  while true do
+    local info = getDestinationInfo(resolvedName)
 
-  header()
-  print("DOSSIER DE DESTINATION")
-  separator()
-  print("CODE     : " .. string.upper(resolvedName))
-  print("ADRESSE  : " .. address)
-  print("GALAXIE  : " .. info.galaxy)
-  print("STATUT   : " .. info.status)
-  print("MENACE   : " .. info.threat)
-  print()
-  print("NOTES")
-  separator()
-  print(info.notes)
-  waitForEnter()
+    header()
+    printColored(
+      "DOSSIER DE RENSEIGNEMENT GALACTIQUE",
+      UI_COLORS.cyan
+    )
+    separator()
+    print("CODE        : " .. string.upper(resolvedName))
+    print("ADRESSE     : " .. address)
+    print("GALAXIE     : " .. info.galaxy)
+    print("STATUT      : " .. info.status)
+    print("MENACE      : " .. info.threat)
+    print("POPULATION  : " .. info.population)
+    print("CONTACT     : " .. info.contact)
+    print()
+    print("VISITES     : " .. tostring(info.visits))
+    print("RETOURS     : " .. tostring(info.returns))
+    print("DECOUVERTE  : " .. info.discoveredBy)
+    print("DERN. DEPART: " .. formatIntelTime(info.lastVisit))
+    print("DERN. RETOUR: " .. formatIntelTime(info.lastReturn))
+    print()
+    print("NOTES")
+    separator()
+    print(info.notes)
+    print()
+    print("1 - Modifier le dossier")
+    print("0 - Retour")
+    print()
+    io.write("Action > ")
+
+    local choice = io.read()
+
+    if choice == "0" then
+      return
+    elseif choice == "1" then
+      editIntelligenceRecord(resolvedName)
+    else
+      print("Commande inconnue.")
+      pause(1)
+    end
+  end
 end
 
 local function destinationDatabase()
@@ -2848,6 +3146,89 @@ local function showMethods()
   waitForEnter()
 end
 
+local function readLastEvent()
+  initializeLog()
+  local file = io.open(MISSION_LOG_FILE, "r")
+
+  if not file then
+    return "Aucun evenement operationnel"
+  end
+
+  local last = nil
+
+  for line in file:lines() do
+    if line ~= "" then
+      last = line
+    end
+  end
+
+  file:close()
+  return last or "Aucun evenement operationnel"
+end
+
+local function showTacticalDashboard()
+  header()
+
+  local state, chevrons, direction = getGateState()
+  local energy = getEnergy()
+  local activeCount = 0
+
+  printColored("TABLEAU TACTIQUE", UI_COLORS.cyan)
+  separator()
+  print("PORTE      : " .. safeToString(state) ..
+    "  | CHEVRONS : " .. safeToString(chevrons))
+  print("DIRECTION  : " .. safeToString(direction))
+  print("IRIS       : " .. safeToString(getIrisState()))
+  print("ENERGIE    : " ..
+    (energy and tostring(energy) .. " SU" or "INCONNUE"))
+  print("ALARME     : " ..
+    (alarmActive and "ACTIVE" or "PRETE"))
+  print()
+
+  printColored("EQUIPES SG", UI_COLORS.cyan)
+  separator()
+
+  for _, team in ipairs(SG_TEAMS) do
+    local record = teamState[team] or defaultTeamRecord(team)
+
+    if record.status == "EN MISSION" then
+      activeCount = activeCount + 1
+      local elapsed =
+        currentTimestamp() - (record.startedAt or 0)
+
+      printColored(
+        team .. "  EN MISSION  " ..
+        formatDuration(elapsed),
+        UI_COLORS.yellow
+      )
+      print("      " ..
+        string.upper(record.destination or "INCONNUE") ..
+        " / " .. safeToString(record.missionType))
+    else
+      printColored(
+        team .. "  DISPONIBLE",
+        UI_COLORS.green
+      )
+    end
+  end
+
+  print()
+  separator()
+  print("Equipes deployees : " .. tostring(activeCount))
+  print()
+  printColored("DERNIER EVENEMENT", UI_COLORS.cyan)
+  separator()
+
+  local lastEvent = readLastEvent()
+
+  if #lastEvent > 78 then
+    lastEvent = lastEvent:sub(1, 75) .. "..."
+  end
+
+  print(lastEvent)
+  print()
+end
+
 ------------------------------------------------------------
 -- MENU PRINCIPAL
 ------------------------------------------------------------
@@ -2856,6 +3237,7 @@ local function main()
   initializeLog()
   loadTeams()
   loadDefcon()
+  loadIntelligence()
 
   findGate()
   findAlarm()
@@ -2868,7 +3250,7 @@ local function main()
   -- restée active après un ancien plantage.
   emergencyAlarmStop()
 
-  log("Demarrage du systeme SGC - DEFCON + PROTOCOLES")
+  log("Demarrage du systeme SGC - TABLEAU TACTIQUE + RENSEIGNEMENT")
 
   if not gate then
     header()
@@ -2891,43 +3273,14 @@ local function main()
       incomingConnectionScreen()
     end
 
-    header()
-
-    local state, chevrons, direction = getGateState()
-    local energy = getEnergy()
-    local localAddress = getLocalAddress()
-    local remoteAddress = getRemoteAddress()
-
-    print("ALERTE   : " .. defconLevel)
-    print("MOTIF    : " .. defconReason)
-    print("PORTE    : " .. safeToString(state))
-    print("CHEVRONS : " .. safeToString(chevrons))
-    print("DIRECTION: " .. safeToString(direction))
-    print("ADRESSE  : " .. safeToString(localAddress))
-    print("DISTANTE : " .. safeToString(remoteAddress))
-    print("IRIS     : " .. safeToString(getIrisState()))
-
-    if energy then
-      print("ENERGIE  : " .. tostring(energy) .. " SU")
-    else
-      print("ENERGIE  : INCONNUE")
-    end
-
-    if alarm then
-      print("ALARME   : " ..
-        (alarmActive and "ACTIVE" or "PRETE"))
-    else
-      print("ALARME   : NON DETECTEE")
-    end
-
-    print()
+    showTacticalDashboard()
     separator()
     print("1 - Centre des operations")
     print("2 - Autoriser une mission SG")
     print("3 - Composition manuelle")
     print("4 - Fermer la porte")
     print("5 - Controler l'iris")
-    print("6 - Base de donnees planetaires")
+    print("6 - Centre de renseignement")
     print("7 - Carnet d'adresses")
     print("8 - Administration des equipes")
     print("9 - Journal des missions")
@@ -3017,6 +3370,7 @@ local function main()
     elseif choice == "16" then
       saveTeams()
       saveDefcon()
+      saveIntelligence()
       removeIDCListener()
       removeIncomingListener()
       emergencyAlarmStop()
@@ -3042,6 +3396,7 @@ end
 
 local function emergencyCleanup(errorMessage)
   saveDefcon()
+  saveIntelligence()
   removeIDCListener()
   removeIncomingListener()
   emergencyAlarmStop()
