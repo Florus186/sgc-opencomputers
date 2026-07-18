@@ -412,11 +412,13 @@ local function normalizeName(name)
 end
 
 local function resolveDestination(input)
-  local name = normalizeName(input)
-  local savedAddress = ADDRESS_BOOK[name]
+  local requestedName = normalizeName(input)
 
-  if savedAddress then
-    return normalizeAddress(savedAddress), name
+  for savedName, savedAddress in pairs(ADDRESS_BOOK) do
+    if normalizeName(savedName) == requestedName then
+      return normalizeAddress(savedAddress),
+             normalizeName(savedName)
+    end
   end
 
   return normalizeAddress(input), nil
