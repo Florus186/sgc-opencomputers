@@ -35,6 +35,24 @@ local AUTO_CLOSE_IRIS_ON_INCOMING = true
 -- L'alarme entrante reste active jusqu'à l'affichage de l'alerte.
 local INCOMING_ALARM = true
 
+-- Système IDC.
+-- Matériel recommandé : une paire de Linked Cards OpenComputers.
+-- Le programme accepte aussi une carte réseau sur le port indiqué.
+local IDC_ENABLED = true
+local IDC_NETWORK_PORT = 1701
+local IDC_SECURITY_MODE = "CONFIRMATION"
+-- Modes possibles :
+-- "AUTOMATIQUE"   : ouvre l'iris dès qu'un IDC valide est reçu.
+-- "CONFIRMATION"  : demande l'accord de l'opérateur.
+-- "VERROUILLE"    : aucune ouverture automatique.
+
+local IDC_CODES = {
+  ["SG-1"] = "1701",
+  ["SG-2"] = "2202",
+  ["SG-3"] = "3303",
+  ["SG-4"] = "4404"
+}
+
 -- Carnet d'adresses.
 -- Remplace les exemples par les vraies adresses de tes portes.
 -- Les noms sont saisis sans distinction entre majuscules/minuscules.
@@ -111,6 +129,13 @@ local teamState = {}
 
 -- Déclaration anticipée, définie plus bas.
 local normalizeAddress
+
+-- Communication IDC : Linked Card ("tunnel") ou carte réseau ("modem").
+local idcTransport = nil
+local idcTransportType = nil
+local idcListenerInstalled = false
+local latestIDC = nil
+local idcFailureCount = 0
 
 ------------------------------------------------------------
 -- OUTILS
@@ -741,6 +766,241 @@ local function findDestinationByAddress(rawAddress)
   return nil
 end
 
+local function normalizeIDC(value)
+  return tostring(value or ""):gsub("%s+", "")
+end
+
+local function findTeamByIDC(code)
+  local wanted = normalizeIDC(code)
+
+  for team, configuredCode in pairs(IDC_CODES) do
+    if normalizeIDC(configuredCode) == wanted then
+      return team
+    end
+  end
+
+  return nil
+end
+
+local function initializeIDCTransport()
+  if not IDC_ENABLED then
+    return false, "IDC désactivé"
+  end
+
+  if component.isAvailable("tunnel") then
+    idcTransport = component.tunnel
+    idcTransportType = "LINKED CARD"
+    log("Transport IDC détecté : Linked Card")
+    return true
+  end
+
+  if component.isAvailable("modem") then
+    idcTransport = component.modem
+    idcTransportType = "CARTE RESEAU"
+
+    local ok, reason = pcall(idcTransport.open, IDC_NETWORK_PORT)
+
+    if not ok then
+      log("Impossible d'ouvrir le port IDC : " ..
+        safeToString(reason))
+      return false, reason
+    end
+
+    log("Transport IDC détecté : carte réseau, port " ..
+      tostring(IDC_NETWORK_PORT))
+    return true
+  end
+
+  idcTransport = nil
+  idcTransportType = nil
+  log("Aucun transport IDC détecté")
+  return false, "Aucune Linked Card ou carte réseau"
+end
+
+local function recordIDCIncident(message)
+  idcFailureCount = idcFailureCount + 1
+
+  missionLog(
+    "INCIDENT IDC | " .. tostring(message) ..
+    " | ECHECS " .. tostring(idcFailureCount)
+  )
+
+  log("INCIDENT IDC : " .. tostring(message))
+end
+
+local function validateIDC(team, code, originAddress)
+  local expected = IDC_CODES[team]
+
+  if not expected then
+    return false, "Aucun IDC configuré pour " .. safeToString(team)
+  end
+
+  if normalizeIDC(code) ~= normalizeIDC(expected) then
+    return false, "Code incorrect pour " .. safeToString(team)
+  end
+
+  local mission = teamState[team]
+
+  if not mission or mission.status ~= "EN MISSION" then
+    return false, team .. " n'est pas enregistrée en mission"
+  end
+
+  local receivedOrigin = normalizeAddress(originAddress or "")
+  local expectedOrigin = normalizeAddress(mission.address or "")
+
+  if receivedOrigin ~= ""
+     and expectedOrigin ~= ""
+     and receivedOrigin ~= expectedOrigin then
+    return false, "Origine incompatible avec la mission de " .. team
+  end
+
+  return true, mission
+end
+
+local function openIrisForValidatedIDC(team, mission)
+  if IDC_SECURITY_MODE == "VERROUILLE" then
+    return false, "Mode verrouillé"
+  end
+
+  local ok, result, reason = pcall(gate.openIris)
+
+  if not ok or result == nil then
+    return false, safeToString(ok and reason or result)
+  end
+
+  waitForIrisState("Open", 10)
+  emergencyAlarmStop()
+
+  missionLog(
+    "IDC VALIDE | " .. team ..
+    " | " .. string.upper(mission.destination or "INCONNUE") ..
+    " | IRIS OUVERTE"
+  )
+
+  log("IDC valide reçu pour " .. team .. ", iris ouverte")
+  return true
+end
+
+local function idcMessageHandler(
+  _, localAddress, remoteAddress, port, distance,
+  protocol, team, code, originAddress
+)
+  if protocol ~= "SGC-IDC-1" then
+    return
+  end
+
+  if idcTransportType == "CARTE RESEAU"
+     and tonumber(port) ~= IDC_NETWORK_PORT then
+    return
+  end
+
+  team = tostring(team or "")
+  code = normalizeIDC(code)
+  originAddress = normalizeAddress(originAddress or "")
+
+  local valid, result = validateIDC(team, code, originAddress)
+
+  latestIDC = {
+    receivedAt = computer.uptime(),
+    sender = remoteAddress,
+    team = team,
+    code = code,
+    origin = originAddress,
+    valid = valid,
+    reason = valid and "IDC VALIDE" or tostring(result)
+  }
+
+  if not valid then
+    closeIrisImmediately()
+    siren(true)
+    recordIDCIncident(
+      safeToString(team) .. " | " ..
+      safeToString(originAddress) .. " | " ..
+      safeToString(result)
+    )
+    return
+  end
+
+  idcFailureCount = 0
+
+  missionLog(
+    "IDC RECU | " .. team ..
+    " | " .. string.upper(result.destination or "INCONNUE") ..
+    " | MODE " .. IDC_SECURITY_MODE
+  )
+
+  if IDC_SECURITY_MODE == "AUTOMATIQUE" then
+    local opened, reason =
+      openIrisForValidatedIDC(team, result)
+
+    latestIDC.openedAutomatically = opened
+    latestIDC.openError = reason
+  end
+end
+
+local function installIDCListener()
+  if not IDC_ENABLED or idcListenerInstalled then
+    return true
+  end
+
+  local okTransport = initializeIDCTransport()
+
+  if not okTransport then
+    return false
+  end
+
+  local ok, reason =
+    event.listen("modem_message", idcMessageHandler)
+
+  if ok then
+    idcListenerInstalled = true
+    return true
+  end
+
+  log("Impossible d'installer l'écoute IDC : " ..
+    safeToString(reason))
+  return false, reason
+end
+
+local function removeIDCListener()
+  if idcListenerInstalled then
+    pcall(event.ignore, "modem_message", idcMessageHandler)
+    idcListenerInstalled = false
+  end
+
+  if idcTransportType == "CARTE RESEAU"
+     and idcTransport
+     and idcTransport.close then
+    pcall(idcTransport.close, IDC_NETWORK_PORT)
+  end
+end
+
+local function getIDCForMission(mission, incomingAddress)
+  if not latestIDC then
+    return nil
+  end
+
+  if computer.uptime() - latestIDC.receivedAt > 120 then
+    return nil
+  end
+
+  if latestIDC.team ~= mission.team then
+    return nil
+  end
+
+  local valid, result =
+    validateIDC(
+      latestIDC.team,
+      latestIDC.code,
+      incomingAddress
+    )
+
+  latestIDC.valid = valid
+  latestIDC.reason = valid and "IDC VALIDE" or tostring(result)
+
+  return latestIDC
+end
+
 local function closeIrisImmediately()
   if not gate or not gate.closeIris then
     return false, "Commande closeIris indisponible"
@@ -864,7 +1124,40 @@ local function incomingConnectionScreen()
   incoming.returnMission =
     findMissionByAddress(incoming.address)
 
+  local function completeReturn(mission)
+    local elapsed =
+      currentTimestamp() - (mission.startedAt or 0)
+
+    setTeamAvailable(mission.team)
+
+    missionLog(
+      "RETOUR CONFIRME | " .. mission.team ..
+      " | " .. string.upper(
+        mission.destination or "INCONNUE"
+      ) ..
+      " | DUREE " .. formatDuration(elapsed)
+    )
+
+    log(
+      "Retour confirmé de " .. mission.team ..
+      " depuis " .. safeToString(incoming.address)
+    )
+
+    print()
+    print("MISSION TERMINEE")
+    print("Equipe : " .. mission.team)
+    print("Duree  : " .. formatDuration(elapsed))
+    waitForEnter()
+  end
+
   while true do
+    local receivedIDC = nil
+
+    if incoming.returnMission then
+      receivedIDC =
+        getIDCForMission(incoming.returnMission, incoming.address)
+    end
+
     header()
     print("********************************")
 
@@ -877,12 +1170,8 @@ local function incomingConnectionScreen()
     print("********************************")
     print()
 
-    if incoming.name then
-      print("ORIGINE : " .. string.upper(incoming.name))
-    else
-      print("ORIGINE : INCONNUE")
-    end
-
+    print("ORIGINE : " ..
+      (incoming.name and string.upper(incoming.name) or "INCONNUE"))
     print("ADRESSE : " ..
       (incoming.address ~= "" and incoming.address or "NON RECUE"))
 
@@ -902,19 +1191,36 @@ local function incomingConnectionScreen()
       print("EQUIPE  : " .. mission.team)
       print("MISSION : " .. mission.missionType)
       print("DUREE   : " .. formatDuration(elapsed))
+      print("MODE IDC: " .. IDC_SECURITY_MODE)
+      print("RESEAU  : " ..
+        safeToString(idcTransportType or "NON DETECTE"))
+
+      if receivedIDC then
+        print("IDC     : " ..
+          (receivedIDC.valid and "VALIDE" or "INVALIDE"))
+
+        if not receivedIDC.valid then
+          print("DETAIL  : " .. safeToString(receivedIDC.reason))
+        elseif receivedIDC.openedAutomatically then
+          print("ACTION  : IRIS OUVERTE AUTOMATIQUEMENT")
+        end
+      else
+        print("IDC     : EN ATTENTE")
+      end
+
       print()
     end
 
     if incoming.irisError then
       print("ATTENTION : fermeture automatique")
-      print("de l'iris non confirmee.")
+      print("de l'iris non confirmée.")
       print("Detail : " .. safeToString(incoming.irisError))
       print()
     end
 
     if state == "Idle" or state == "Offline" then
       emergencyAlarmStop()
-      print("La connexion entrante est terminee.")
+      print("La connexion entrante est terminée.")
       log("Fin de connexion entrante [" ..
         safeToString(incoming.address) .. "]")
       waitForEnter()
@@ -924,14 +1230,16 @@ local function incomingConnectionScreen()
     separator()
 
     if incoming.returnMission then
-      print("1 - Confirmer le retour et ouvrir l'iris")
-      print("2 - Maintenir l'iris ferme")
-      print("3 - Signaler une anomalie")
-      print("4 - Actualiser")
-      print("5 - Fermer la connexion")
+      print("1 - Traiter le dernier IDC reçu")
+      print("2 - Saisir un IDC manuellement")
+      print("3 - Ouvrir l'iris sans IDC")
+      print("4 - Maintenir l'iris fermée")
+      print("5 - Signaler une anomalie")
+      print("6 - Actualiser")
+      print("7 - Fermer la connexion")
     else
-      print("1 - Ouvrir l'iris")
-      print("2 - Maintenir l'iris ferme")
+      print("1 - Ouvrir l'iris manuellement")
+      print("2 - Maintenir l'iris fermée")
       print("3 - Fermer la connexion")
       print("4 - Actualiser")
     end
@@ -942,7 +1250,95 @@ local function incomingConnectionScreen()
 
     local choice = io.read()
 
-    if choice == "1" then
+    if incoming.returnMission and choice == "1" then
+      if not receivedIDC then
+        print()
+        print("AUCUN IDC RECU POUR CETTE EQUIPE")
+        pause(2)
+
+      elseif not receivedIDC.valid then
+        closeIrisImmediately()
+        siren(true)
+        print()
+        print("IDC INVALIDE")
+        print(safeToString(receivedIDC.reason))
+        pause(2)
+
+      elseif IDC_SECURITY_MODE == "VERROUILLE" then
+        print()
+        print("MODE VERROUILLE")
+        print("L'iris ne peut pas être ouverte par IDC.")
+        pause(2)
+
+      else
+        local opened, reason =
+          openIrisForValidatedIDC(
+            incoming.returnMission.team,
+            incoming.returnMission
+          )
+
+        if opened then
+          completeReturn(incoming.returnMission)
+          return
+        end
+
+        print()
+        print("ECHEC D'OUVERTURE : " .. safeToString(reason))
+        pause(2)
+      end
+
+    elseif incoming.returnMission and choice == "2" then
+      print()
+      io.write("IDC reçu > ")
+      local manualCode = io.read()
+
+      local valid, result =
+        validateIDC(
+          incoming.returnMission.team,
+          manualCode,
+          incoming.address
+        )
+
+      if not valid then
+        closeIrisImmediately()
+        siren(true)
+        recordIDCIncident(
+          incoming.returnMission.team ..
+          " | SAISIE MANUELLE | " ..
+          safeToString(result)
+        )
+        print()
+        print("IDC INVALIDE")
+        print(safeToString(result))
+        pause(2)
+
+      elseif IDC_SECURITY_MODE == "VERROUILLE" then
+        missionLog(
+          "IDC MANUEL VALIDE MAIS VERROUILLE | " ..
+          incoming.returnMission.team
+        )
+        print()
+        print("IDC VALIDE, MAIS MODE VERROUILLE")
+        pause(2)
+
+      else
+        local opened, reason =
+          openIrisForValidatedIDC(
+            incoming.returnMission.team,
+            incoming.returnMission
+          )
+
+        if opened then
+          completeReturn(incoming.returnMission)
+          return
+        end
+
+        print()
+        print("ECHEC D'OUVERTURE : " .. safeToString(reason))
+        pause(2)
+      end
+
+    elseif incoming.returnMission and choice == "3" then
       local ok, result, reason = pcall(gate.openIris)
 
       if not ok or result == nil then
@@ -954,51 +1350,28 @@ local function incomingConnectionScreen()
         waitForIrisState("Open", 10)
         emergencyAlarmStop()
 
-        if incoming.returnMission then
-          local mission = incoming.returnMission
-          local elapsed =
-            currentTimestamp() - (mission.startedAt or 0)
+        missionLog(
+          "OUVERTURE FORCEE SANS IDC | " ..
+          incoming.returnMission.team ..
+          " | " .. safeToString(incoming.address)
+        )
 
-          setTeamAvailable(mission.team)
-
-          missionLog(
-            "RETOUR CONFIRME | " .. mission.team ..
-            " | " .. string.upper(
-              mission.destination or "INCONNUE"
-            ) ..
-            " | DUREE " .. formatDuration(elapsed)
-          )
-
-          log(
-            "Retour confirme de " .. mission.team ..
-            " depuis " .. safeToString(incoming.address)
-          )
-
-          print()
-          print("MISSION TERMINEE")
-          print("Equipe : " .. mission.team)
-          print("Duree  : " .. formatDuration(elapsed))
-          waitForEnter()
-          return
-        end
-
-        log("Iris ouvert pour connexion entrante depuis " ..
-          safeToString(incoming.address))
+        completeReturn(incoming.returnMission)
+        return
       end
 
-    elseif choice == "2" then
+    elseif incoming.returnMission and choice == "4" then
       closeIrisImmediately()
       emergencyAlarmStop()
-      log("Iris maintenu ferme pour connexion entrante depuis " ..
-        safeToString(incoming.address))
+      log("Iris maintenue fermée pour retour de " ..
+        incoming.returnMission.team)
       print()
-      print("IRIS MAINTENU FERME")
-      print("Surveillance de la connexion...")
+      print("IRIS MAINTENUE FERMEE")
       pause(1)
 
-    elseif choice == "3" and incoming.returnMission then
+    elseif incoming.returnMission and choice == "5" then
       closeIrisImmediately()
-      emergencyAlarmStop()
+      siren(true)
 
       missionLog(
         "ANOMALIE RETOUR | " ..
@@ -1008,31 +1381,48 @@ local function incomingConnectionScreen()
 
       print()
       print("ANOMALIE ENREGISTREE")
-      print("L'iris reste ferme.")
+      print("L'iris reste fermée.")
       pause(2)
 
-    elseif choice == "3"
-       or (choice == "5" and incoming.returnMission) then
-      local ok, result, reason = pcall(gate.disconnect)
+    elseif incoming.returnMission and choice == "6" then
+      -- Réaffichage.
 
+    elseif incoming.returnMission and choice == "7" then
+      pcall(gate.disconnect)
       emergencyAlarmStop()
+      return
+
+    elseif not incoming.returnMission and choice == "1" then
+      local ok, result, reason = pcall(gate.openIris)
 
       if not ok or result == nil then
         print()
-        print("ECHEC DE DECONNEXION : " ..
+        print("ECHEC D'OUVERTURE : " ..
           safeToString(ok and reason or result))
         pause(2)
       else
-        log("Connexion entrante fermee manuellement depuis " ..
-          safeToString(incoming.address))
-        print()
-        print("Commande de fermeture envoyee.")
-        pause(1)
-        return
+        waitForIrisState("Open", 10)
+        emergencyAlarmStop()
+        missionLog(
+          "OUVERTURE MANUELLE ORIGINE NON AUTHENTIFIEE | " ..
+          safeToString(incoming.address)
+        )
       end
 
-    elseif choice == "4" then
-      -- Réaffichage des informations.
+    elseif not incoming.returnMission and choice == "2" then
+      closeIrisImmediately()
+      emergencyAlarmStop()
+      print()
+      print("IRIS MAINTENUE FERMEE")
+      pause(1)
+
+    elseif not incoming.returnMission and choice == "3" then
+      pcall(gate.disconnect)
+      emergencyAlarmStop()
+      return
+
+    elseif not incoming.returnMission and choice == "4" then
+      -- Réaffichage.
 
     else
       print()
@@ -1814,6 +2204,64 @@ local function teamAdministration()
   end
 end
 
+local function showIDCSecurity()
+  while true do
+    header()
+    print("SECURITE IDC")
+    separator()
+    print("Transport : " ..
+      safeToString(idcTransportType or "NON DETECTE"))
+    print("Port      : " .. tostring(IDC_NETWORK_PORT))
+    print("Mode      : " .. IDC_SECURITY_MODE)
+    print("Incidents : " .. tostring(idcFailureCount))
+    print()
+
+    for _, team in ipairs(SG_TEAMS) do
+      print(team .. " : IDC CONFIGURE")
+    end
+
+    print()
+    separator()
+    print("1 - Mode AUTOMATIQUE")
+    print("2 - Mode CONFIRMATION")
+    print("3 - Mode VERROUILLE")
+    print("4 - Réinitialiser le transport")
+    print("0 - Retour")
+    separator()
+    print()
+    io.write("Choix > ")
+
+    local choice = io.read()
+
+    if choice == "1" then
+      IDC_SECURITY_MODE = "AUTOMATIQUE"
+      missionLog("MODE IDC | AUTOMATIQUE")
+
+    elseif choice == "2" then
+      IDC_SECURITY_MODE = "CONFIRMATION"
+      missionLog("MODE IDC | CONFIRMATION")
+
+    elseif choice == "3" then
+      IDC_SECURITY_MODE = "VERROUILLE"
+      closeIrisImmediately()
+      missionLog("MODE IDC | VERROUILLE")
+
+    elseif choice == "4" then
+      removeIDCListener()
+      initializeIDCTransport()
+      installIDCListener()
+      pause(1)
+
+    elseif choice == "0" then
+      return
+
+    else
+      print("Choix inconnu.")
+      pause(1)
+    end
+  end
+end
+
 local function showMissionLogs()
   header()
   print("JOURNAL DES MISSIONS")
@@ -1896,6 +2344,7 @@ local function main()
 
   if gate then
     installIncomingListener()
+    installIDCListener()
   end
 
   -- Au démarrage, on arrête une éventuelle alarme
@@ -1967,7 +2416,8 @@ local function main()
     print("11 - Diagnostic complet")
     print("12 - Methodes SGCraft")
     print("13 - Arret d'urgence de l'alarme")
-    print("14 - Quitter")
+    print("14 - Sécurité IDC")
+    print("15 - Quitter")
     separator()
     print()
 
@@ -2039,7 +2489,11 @@ local function main()
       waitForEnter()
 
     elseif choice == "14" then
+      showIDCSecurity()
+
+    elseif choice == "15" then
       saveTeams()
+      removeIDCListener()
       removeIncomingListener()
       emergencyAlarmStop()
       log("Arret normal du systeme SGC")
@@ -2063,6 +2517,7 @@ end
 ------------------------------------------------------------
 
 local function emergencyCleanup(errorMessage)
+  removeIDCListener()
   removeIncomingListener()
   emergencyAlarmStop()
 
